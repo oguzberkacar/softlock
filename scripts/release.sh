@@ -63,6 +63,7 @@ gh release create "$TAG" \
       inside {print}
     ' "$ROOT_DIR/CHANGELOG.md") \
   "$STAGING/$DMG_NAME" \
-  "$STAGING/appcast.xml"
+  "$STAGING/appcast.xml" \
+  "$STAGING/SoftLock-$VERSION.html"
 
 echo "Released $TAG (build $BUILD): https://github.com/$REPO/releases/tag/$TAG"
