@@ -5,6 +5,16 @@ All notable changes to SoftLock are documented here. This file mirrors the in-ap
 `Sources/SoftLock/main.swift`. Keep both in sync when cutting a release, and bump
 `CFBundleShortVersionString` in `scripts/package-app.sh` to match.
 
+## 0.5.1 — 2026-09-25
+
+- Face unlock no longer scans by itself when the lock screen appears. The lock badge becomes a
+  camera button: tap it, or press **Space**, to scan. Automatic scanning meant locking the Mac
+  and walking away could let the camera catch you on the way out and unlock right again. The old
+  behaviour is still available as **Scan automatically when locked** in Settings → Security.
+- Lock-screen status messages moved to the bottom of the screen, so a message appearing or
+  growing no longer shifts the passcode layout.
+- Locking again after a face unlock no longer shows the previous scan's green tick on the badge.
+
 ## 0.5.0 — 2026-09-25
 
 - **Automatic updates** (Sparkle). SoftLock checks once a day for a new version and shows

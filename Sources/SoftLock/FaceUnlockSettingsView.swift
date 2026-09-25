@@ -17,6 +17,9 @@ final class FaceUnlockSettingsView: NSView {
     private let testButton = NSButton(title: "Test Recognition…", target: nil, action: nil)
     private let deleteButton = NSButton(title: "Delete Face Data", target: nil, action: nil)
     private let warningLabel = NSTextField(wrappingLabelWithString: "")
+    private let autoScanSwitch = NSSwitch()
+    private let autoScanLabel = NSTextField(labelWithString: "Scan automatically when locked")
+    private let autoScanHint = NSTextField(wrappingLabelWithString: "")
     private let livenessPopUp = NSPopUpButton()
     private let livenessLabel = NSTextField(labelWithString: "Liveness checks")
     private let livenessHint = NSTextField(wrappingLabelWithString: "")
@@ -59,6 +62,17 @@ final class FaceUnlockSettingsView: NSView {
         testButton.target = self
         testButton.action = #selector(testTapped)
         testButton.bezelStyle = .rounded
+        autoScanLabel.font = .systemFont(ofSize: 13)
+        autoScanLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        autoScanSwitch.target = self
+        autoScanSwitch.action = #selector(autoScanChanged)
+        let autoScanRow = NSStackView(views: [autoScanLabel, autoScanSwitch])
+        autoScanRow.orientation = .horizontal
+        autoScanRow.alignment = .centerY
+        autoScanHint.font = .systemFont(ofSize: 11.5)
+        autoScanHint.textColor = .secondaryLabelColor
+        autoScanHint.preferredMaxLayoutWidth = Self.contentWidth
+
         livenessLabel.font = .systemFont(ofSize: 13)
         livenessLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         livenessPopUp.target = self
@@ -83,7 +97,7 @@ final class FaceUnlockSettingsView: NSView {
         warningLabel.preferredMaxLayoutWidth = Self.contentWidth
         warningLabel.stringValue = "Less secure than Touch ID or your passcode. Face unlock uses the regular 2D camera, and liveness checks cannot rule out a video or a good mask of you. Use it for convenience, not for protecting sensitive data. Your passcode always works, and after \(FaceUnlockThrottle.defaultMaxFailures) missed scans face unlock pauses until you unlock another way. Only encrypted face signatures are stored, on this Mac; camera frames are never saved."
 
-        let stack = NSStackView(views: [header, statusLabel, buttons, livenessRow, livenessHint, warningLabel])
+        let stack = NSStackView(views: [header, statusLabel, buttons, autoScanRow, autoScanHint, livenessRow, livenessHint, warningLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -98,6 +112,8 @@ final class FaceUnlockSettingsView: NSView {
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            autoScanRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            autoScanHint.widthAnchor.constraint(equalTo: stack.widthAnchor),
             livenessRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             livenessHint.widthAnchor.constraint(equalTo: stack.widthAnchor),
             warningLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -113,6 +129,7 @@ final class FaceUnlockSettingsView: NSView {
 
         if enrolled == false, settings.isEnabled { settings.isEnabled = false }
         refreshLivenessHint()
+        refreshAutoScan()
         toggle.state = settings.isEnabled ? .on : .off
         toggle.isEnabled = modelAvailable && enrolled
         enrollButton.title = enrolled ? "Re-enroll Face…" : "Set Up Face…"
@@ -131,13 +148,31 @@ final class FaceUnlockSettingsView: NSView {
             statusLabel.textColor = .systemRed
         } else {
             statusLabel.stringValue = settings.isEnabled
-                ? "On. The lock screen scans for your face and needs a blink or slight head turn."
+                ? (settings.autoScanOnLock
+                    ? "On. The lock screen scans for your face as soon as it appears."
+                    : "On. On the lock screen, press Space or tap the camera button to scan.")
                 : "Face enrolled. Turn on to use it on the lock screen."
             statusLabel.textColor = .secondaryLabelColor
         }
     }
 
     // MARK: - Actions
+
+    private func refreshAutoScan() {
+        let settings = FaceUnlockSettings.shared
+        autoScanSwitch.state = settings.autoScanOnLock ? .on : .off
+        autoScanSwitch.isEnabled = settings.isEnabled
+        autoScanLabel.textColor = settings.isEnabled ? .labelColor : .disabledControlTextColor
+        autoScanHint.stringValue = settings.autoScanOnLock
+            ? "The camera starts looking the moment the lock screen appears — walking past the Mac can unlock it right after you lock it."
+            : "The lock screen waits for you: press Space or tap the camera button to scan. Recommended if you lock before leaving the desk."
+        autoScanHint.textColor = settings.autoScanOnLock ? .systemOrange : .secondaryLabelColor
+    }
+
+    @objc private func autoScanChanged() {
+        FaceUnlockSettings.shared.autoScanOnLock = autoScanSwitch.state == .on
+        refreshAutoScan()
+    }
 
     @objc private func livenessChanged() {
         guard let raw = livenessPopUp.selectedItem?.representedObject as? String,

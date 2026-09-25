@@ -26,6 +26,15 @@ private enum Changelog {
 
     static let entries: [Entry] = [
         Entry(
+            version: "0.5.1",
+            date: "2026-09-25",
+            changes: [
+                "Face unlock waits for you: the lock badge is now a camera button, and pressing Space starts a scan too. Scanning automatically meant locking the Mac and walking away could unlock it again on the way out. Turn Scan automatically when locked back on in Settings > Security if you prefer the old behaviour.",
+                "Lock-screen status messages sit at the bottom of the screen, so a message appearing never shifts the passcode layout.",
+                "Locking again right after a face unlock no longer shows the last scan's green tick."
+            ]
+        ),
+        Entry(
             version: "0.5.0",
             date: "2026-09-25",
             changes: [
@@ -2070,6 +2079,8 @@ private final class LockerController: NSObject {
     private var faceSession: AVCaptureSession?
     private var faceViewState: FaceUnlockViewState = .scanning
     private var touchIDButton: NSButton?
+    private var faceScanButton: NSButton?
+    private var faceScanKeyMonitor: Any?
     private var pinInputView: PINInputView?
     private var pinRecoveryField: NSSecureTextField?
     private var pinRecoveryContainer: NSView?
@@ -2107,6 +2118,10 @@ private final class LockerController: NSObject {
     func lock(trigger: LockTrigger) {
         requestAccessibilityIfNeeded()
         startObservingDisplayChanges()
+        // Before rebuilding: a previous face unlock leaves the green ring and tick behind, and a
+        // stopped capture session in `faceSession`. A fresh lock screen must not adopt either.
+        faceSession = nil
+        faceViewState = .scanning
         // Rebuild every time so the current blur/title/passcode settings always apply.
         rebuildWindows()
         failedAttempts = 0
@@ -2118,6 +2133,7 @@ private final class LockerController: NSObject {
         installEventTap()
         startClock()
         activateLock()
+        installFaceScanKeyMonitor()
         startFaceUnlockIfNeeded()
     }
 
@@ -2126,6 +2142,23 @@ private final class LockerController: NSObject {
     private func startFaceUnlockIfNeeded() {
         faceSession = nil
         faceViewState = .scanning
+        guard FaceUnlockSettings.shared.isReadyForLockScreen else { return }
+        guard FaceUnlockSettings.shared.autoScanOnLock else {
+            // Manual mode: nothing looks at the camera until the button or Space asks it to.
+            updateFaceScanButton()
+            showStatus(Self.faceScanHint, tone: .info)
+            return
+        }
+        beginFaceScan()
+    }
+
+    /// Starts one face scan cycle. Manual trigger (camera button / Space) and the automatic
+    /// start on lock both come through here.
+    private func beginFaceScan() {
+        guard FaceUnlockSettings.shared.isReadyForLockScreen else { return }
+        // Face unlock respects the brute-force lockout exactly like Touch ID does.
+        guard lockoutTimer == nil, !windows.isEmpty else { return }
+        guard !FaceUnlockController.shared.isScanning else { return }
         let missPhoto: ((FaceCameraFrame) -> Void)? = settings.capturePhotoOnFailure
             ? { [weak self] frame in self?.saveFaceMissPhoto(frame) }
             : nil
@@ -2139,6 +2172,7 @@ private final class LockerController: NSObject {
                 return true
             }
         )
+        updateFaceScanButton()
     }
 
     private func handleFaceEvent(_ event: FaceUnlockEvent) {
@@ -2154,6 +2188,7 @@ private final class LockerController: NSObject {
         case .ended:
             faceSession = nil
             faceSelfView?.detach()
+            updateFaceScanButton()
         }
     }
 
@@ -2184,6 +2219,7 @@ private final class LockerController: NSObject {
         pinRecoveryField = nil
         pinRecoveryContainer = nil
         touchIDButton = nil
+        faceScanButton = nil
         statusLabel = nil
         faceSelfView = nil
         buildWindows()
@@ -2365,7 +2401,15 @@ private final class LockerController: NSObject {
         let usePIN = settings.unlockStyle == .pin
 
         let badgeDiameter: CGFloat = 76
-        let badge = makeLockBadge(appearance: appearance, diameter: badgeDiameter)
+        // With face unlock ready the badge *is* the camera button: it already occupies the spot
+        // the self-view takes over during a scan, so the scan starts where the camera appears.
+        let faceReady = FaceUnlockSettings.shared.isReadyForLockScreen
+        let badge = makeLockBadge(
+            appearance: appearance,
+            diameter: badgeDiameter,
+            symbolName: faceReady ? "faceid" : "lock.fill",
+            symbolDescription: faceReady ? "Scan your face" : "Locked"
+        )
 
         let title = NSTextField(labelWithString: settings.displayTitle)
         title.font = .systemFont(ofSize: compact ? 22 : 26, weight: .semibold)
@@ -2451,13 +2495,20 @@ private final class LockerController: NSObject {
         stack.addArrangedSubview(subtitle)
         stack.setCustomSpacing(compact ? (usePIN ? 18 : 14) : (usePIN ? 26 : 18), after: subtitle)
         stack.addArrangedSubview(inputView)
-        stack.addArrangedSubview(status)
+        // The status pill is not part of the centred stack: it sits at the bottom of the screen
+        // like a toast, so a message appearing or growing never shifts the lock layout and it
+        // reads as feedback rather than as another row of the form.
+        root.addSubview(status)
+        NSLayoutConstraint.activate([
+            status.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: compact ? -28 : -44)
+        ])
 
         // Password unlock has no keypad to host Touch ID, so it keeps the standalone icon
         // button. PIN unlock places Touch ID inside the keypad instead (see above).
         if touchIDAvailable, !usePIN {
             let button = makeTouchIDButton(appearance: appearance)
-            stack.setCustomSpacing(8, after: status)
+            stack.setCustomSpacing(8, after: inputView)
             stack.addArrangedSubview(button)
             touchIDButton = button
         }
@@ -2481,7 +2532,9 @@ private final class LockerController: NSObject {
             stack.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             centerY,
             stack.topAnchor.constraint(greaterThanOrEqualTo: clock.stack.bottomAnchor, constant: 20),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -24)
+            // Keep the centred stack clear of the bottom status pill (it is no longer part of
+            // the stack, so nothing else stops them overlapping on short displays).
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: status.topAnchor, constant: -12)
         ])
 
         statusLabel = status
@@ -2489,6 +2542,19 @@ private final class LockerController: NSObject {
         if FaceUnlockSettings.shared.isReadyForLockScreen {
             // The self-view takes the lock badge's place: same circle, same spot in the stack.
             // It stays hidden until the camera is running, so the padlock shows until then.
+            // Transparent hit area over the badge. Added before the self-view so a running scan's
+            // preview draws on top of it (the button is disabled then anyway).
+            let scanButton = makeFaceScanButton()
+            badge.addSubview(scanButton)
+            NSLayoutConstraint.activate([
+                scanButton.leadingAnchor.constraint(equalTo: badge.leadingAnchor),
+                scanButton.trailingAnchor.constraint(equalTo: badge.trailingAnchor),
+                scanButton.topAnchor.constraint(equalTo: badge.topAnchor),
+                scanButton.bottomAnchor.constraint(equalTo: badge.bottomAnchor)
+            ])
+            faceScanButton = scanButton
+            updateFaceScanButton()
+
             let selfView = LockFaceSelfView(diameter: badgeDiameter)
             badge.addSubview(selfView)
             NSLayoutConstraint.activate([
@@ -2979,6 +3045,64 @@ private final class LockerController: NSObject {
         attemptBiometricUnlock(automatic: false)
     }
 
+    private static let faceScanHint = "Press Space or tap the camera button to scan your face."
+
+    /// Invisible button laid over the lock badge, whose icon is already the camera glyph.
+    private func makeFaceScanButton() -> NSButton {
+        let button = NSButton(title: "", target: self, action: #selector(faceScanTapped))
+        button.isBordered = false
+        button.isTransparent = true
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.toolTip = "Scan your face (Space)"
+        button.setAccessibilityLabel("Scan your face")
+        return button
+    }
+
+    /// Off while a scan is running, so a second tap can't stack another scan cycle on it.
+    private func updateFaceScanButton() {
+        faceScanButton?.isEnabled = !FaceUnlockController.shared.isScanning
+    }
+
+    @objc private func faceScanTapped() {
+        beginFaceScan()
+    }
+
+    /// Space starts a face scan without moving focus off the passcode input. It only fires while
+    /// the input is empty, so a space inside a password is still typed as a space.
+    private func installFaceScanKeyMonitor() {
+        guard faceScanKeyMonitor == nil else { return }
+        faceScanKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.handleFaceScanKey(event) else { return event }
+            return nil
+        }
+    }
+
+    private func removeFaceScanKeyMonitor() {
+        if let faceScanKeyMonitor { NSEvent.removeMonitor(faceScanKeyMonitor) }
+        faceScanKeyMonitor = nil
+    }
+
+    /// True when the event was consumed as the face-scan shortcut.
+    private func handleFaceScanKey(_ event: NSEvent) -> Bool {
+        guard event.keyCode == 49 else { return false } // Space
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty else { return false }
+        guard !windows.isEmpty, lockoutTimer == nil, !biometricInProgress else { return false }
+        guard FaceUnlockSettings.shared.isReadyForLockScreen else { return false }
+        guard !FaceUnlockController.shared.isScanning else { return true }
+        guard isCredentialInputEmpty else { return false }
+        beginFaceScan()
+        return true
+    }
+
+    /// Nothing typed yet in whichever credential field is on screen.
+    private var isCredentialInputEmpty: Bool {
+        if let pinRecoveryContainer, !pinRecoveryContainer.isHidden {
+            return pinRecoveryField?.stringValue.isEmpty ?? true
+        }
+        if let pinInputView { return !pinInputView.hasInput }
+        return passwordField?.stringValue.isEmpty ?? true
+    }
+
     private func attemptBiometricUnlock(automatic: Bool) {
         // Touch ID has to respect the brute-force lockout too, or the standalone button in
         // password mode offers a way around the backoff the keypad enforces.
@@ -3127,6 +3251,10 @@ private final class LockerController: NSObject {
         AppLog.write("unlock begin recoveryUsed=\(recoveryUsed)")
         FaceUnlockController.shared.stop()
         FaceUnlockController.shared.noteUnlockedByOtherMeans()
+        removeFaceScanKeyMonitor()
+        faceSession = nil
+        faceViewState = .scanning
+        faceSelfView?.detach()
         stopObservingDisplayChanges()
         lockoutTimer?.invalidate()
         lockoutTimer = nil
@@ -3484,7 +3612,12 @@ private func makeGlassPanel() -> NSView {
 }
 
 @MainActor
-private func makeLockBadge(appearance: LockForegroundAppearance, diameter: CGFloat = 76) -> NSView {
+private func makeLockBadge(
+    appearance: LockForegroundAppearance,
+    diameter: CGFloat = 76,
+    symbolName: String = "lock.fill",
+    symbolDescription: String = "Locked"
+) -> NSView {
     let container = NSView()
     container.wantsLayer = true
     container.layer?.cornerRadius = diameter / 2
@@ -3495,7 +3628,7 @@ private func makeLockBadge(appearance: LockForegroundAppearance, diameter: CGFlo
     container.translatesAutoresizingMaskIntoConstraints = false
 
     let config = NSImage.SymbolConfiguration(pointSize: 34, weight: .regular)
-    let symbol = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "Locked")?
+    let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: symbolDescription)?
         .withSymbolConfiguration(config)
     let imageView = NSImageView(image: symbol ?? NSImage())
     imageView.contentTintColor = appearance.primaryText
@@ -5115,6 +5248,10 @@ final class PINInputView: NSView {
             dot.layer?.backgroundColor = index < digits.count ? dotColor.cgColor : NSColor.clear.cgColor
         }
     }
+
+    /// Whether any digit has been entered; the lock screen checks it before treating Space as the
+    /// face-scan shortcut.
+    var hasInput: Bool { !digits.isEmpty }
 
     override var acceptsFirstResponder: Bool { true }
 

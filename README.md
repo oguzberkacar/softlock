@@ -78,6 +78,12 @@ sides, tilt up and down), then turn it on. On the lock screen SoftLock looks for
 camera and unlocks the same way Touch ID does. The passcode, PIN and recovery code always keep
 working.
 
+The scan is manual by default: the lock screen shows a camera button, and pressing **Space**
+starts a scan too (Space is only taken as the shortcut while the passcode field is empty, so
+spaces inside a password still type). This is deliberate — with automatic scanning, locking the
+Mac and walking away lets the camera catch you on the way out and unlock right again. Turn on
+**Scan automatically when locked** in Settings → Security if you want the old behaviour.
+
 How it works: Vision finds the face and 5 landmarks, the face is aligned to 112x112, and an
 on-device ArcFace (`w600k_mbf`) Core ML model turns it into a 512-number signature that is
 compared by cosine similarity against your enrolled signatures (strict threshold 0.66; the

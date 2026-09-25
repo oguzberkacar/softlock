@@ -209,6 +209,9 @@ final class LockFaceSelfView: NSView {
         preview?.removeFromSuperview()
         preview = nil
         isHidden = true
+        // Back to neutral: a green ring and tick left over from a successful scan must not be
+        // what the next scan (or the next lock screen) starts from.
+        setState(.scanning)
     }
 
     func setState(_ newState: FaceUnlockViewState) {

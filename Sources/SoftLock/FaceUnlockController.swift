@@ -23,6 +23,7 @@ final class FaceUnlockSettings {
 
     private let enabledKey = "faceUnlockEnabled"
     private let livenessKey = "faceUnlockLiveness"
+    private let autoScanKey = "faceUnlockAutoScan"
     private let defaults = UserDefaults.standard
 
     /// Light (glance's own default) is deny-only: it blocks a face that looks like a photo or a
@@ -37,6 +38,17 @@ final class FaceUnlockSettings {
         }
         set {
             defaults.set(newValue.rawValue, forKey: livenessKey)
+            NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
+        }
+    }
+
+    /// Off by default: the lock screen waits for the camera button (or the Space key) instead of
+    /// scanning the moment it goes up. Auto-scanning means walking past the Mac can unlock it
+    /// again seconds after locking it, which defeats locking before leaving the desk.
+    var autoScanOnLock: Bool {
+        get { defaults.bool(forKey: autoScanKey) }
+        set {
+            defaults.set(newValue, forKey: autoScanKey)
             NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
         }
     }
@@ -98,6 +110,9 @@ final class FaceUnlockController {
 
     private var throttle = FaceUnlockThrottle()
     private var task: Task<Void, Never>?
+    /// True from `begin` until the scan cycle ends (success, timeout, pause or `stop`). The lock
+    /// screen uses it to keep its camera button from starting a second scan on top of one.
+    private(set) var isScanning = false
     private var generation = 0
     private let camera = FaceCameraFeed()
 
@@ -138,12 +153,20 @@ final class FaceUnlockController {
         }
         generation &+= 1
         let current = generation
+        isScanning = true
         task = Task { [weak self] in
             await self?.run(generation: current, onEvent: onEvent, onMissFrame: onMissFrame, onUnlock: onUnlock)
+            guard let self, current == self.generation else { return }
+            self.isScanning = false
+            // `run` can also return before the camera ever started (unreadable profile, camera
+            // failure). `.ended` is idempotent, and without it the lock screen would keep its
+            // camera button disabled forever waiting for a scan that never began.
+            onEvent(.ended)
         }
     }
 
     func stop() {
+        isScanning = false
         generation &+= 1
         task?.cancel()
         task = nil
