@@ -5,6 +5,14 @@ All notable changes to SoftLock are documented here. This file mirrors the in-ap
 `Sources/SoftLock/main.swift`. Keep both in sync when cutting a release, and bump
 `CFBundleShortVersionString` in `scripts/package-app.sh` to match.
 
+## 0.5.2 — 2026-09-25
+
+- Fixed a crash that quit SoftLock while the lock screen was up. Starting the camera and
+  attaching the lock screen's self-view ran at the same time, and AVFoundation aborts the
+  process when the capture session is changed mid-start. The camera now finishes starting
+  before anything attaches to it. This could hit any face scan; the manual scan button in
+  0.5.1 made it easy to reproduce.
+
 ## 0.5.1 — 2026-09-25
 
 - Face unlock no longer scans by itself when the lock screen appears. The lock badge becomes a

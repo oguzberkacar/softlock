@@ -26,6 +26,13 @@ private enum Changelog {
 
     static let entries: [Entry] = [
         Entry(
+            version: "0.5.2",
+            date: "2026-09-25",
+            changes: [
+                "Fixed a crash that could quit SoftLock while the lock screen was up, most often right after starting a face scan."
+            ]
+        ),
+        Entry(
             version: "0.5.1",
             date: "2026-09-25",
             changes: [

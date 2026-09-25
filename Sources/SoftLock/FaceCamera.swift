@@ -63,25 +63,48 @@ final class FaceCameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
     }
 
-    /// Starts capture without prompting. Throws if camera access is not already granted.
-    func start() throws {
+    /// Starts capture without prompting, and returns only once the session is actually running.
+    /// Throws if camera access is not already granted.
+    ///
+    /// Waiting matters: callers attach an `AVCaptureVideoPreviewLayer` as soon as this returns,
+    /// and attaching one mutates the session's connections. Doing that while `startRunning()` is
+    /// still walking those connections on the camera queue throws a collection-mutation
+    /// exception from inside AVFoundation, which aborts the process. Every session mutation
+    /// therefore happens on `queue`, and nothing else touches the session until it is done.
+    func start() async throws {
         guard Self.authorizationStatus == .authorized else { throw FaceCameraError.notAuthorized }
-        try configureIfNeeded()
-        lock.lock()
-        latest = nil
-        warmUpDeadline = Date().addingTimeInterval(Self.warmUpDuration)
-        lock.unlock()
-        queue.async { [session] in
-            if !session.isRunning { session.startRunning() }
+        resetFrameState()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                do {
+                    try configureIfNeeded()
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                if !session.isRunning { session.startRunning() }
+                continuation.resume()
+            }
         }
     }
 
+    /// Blocks until the session has stopped, for the same reason `start` waits: the caller tears
+    /// the preview down straight afterwards.
     func stop() {
-        queue.async { [session] in
+        queue.sync { [session] in
             if session.isRunning { session.stopRunning() }
         }
         lock.lock()
         latest = nil
+        lock.unlock()
+    }
+
+    /// Drops the last frame and restarts the warm-up window. Not `async`-callable inline because
+    /// `NSLock` is unavailable from async contexts, hence the separate non-async method.
+    private func resetFrameState() {
+        lock.lock()
+        latest = nil
+        warmUpDeadline = Date().addingTimeInterval(Self.warmUpDuration)
         lock.unlock()
     }
 

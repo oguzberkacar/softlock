@@ -235,7 +235,7 @@ final class FaceEnrollmentWindowController: NSObject, NSWindowDelegate {
         let embedder: ArcFaceEmbedder
         do {
             embedder = try await Task.detached(priority: .userInitiated) { try ArcFaceEmbedder() }.value
-            try camera.start()
+            try await camera.start()
         } catch {
             fail(error.localizedDescription, showSettings: false, canRetry: true)
             return

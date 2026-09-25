@@ -166,7 +166,7 @@ final class FaceRecognitionTestWindowController: NSObject, NSWindowDelegate {
         let embedder: ArcFaceEmbedder
         do {
             embedder = try await Task.detached(priority: .userInitiated) { try ArcFaceEmbedder() }.value
-            try camera.start()
+            try await camera.start()
         } catch {
             finishRun(passed: false, headline: "Camera problem", scores: " ", detail: error.localizedDescription)
             return

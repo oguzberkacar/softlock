@@ -212,9 +212,15 @@ final class FaceUnlockController {
         guard current == generation else { return }
 
         do {
-            try camera.start()
+            try await camera.start()
         } catch {
             AppFaceLog.write("face unlock: camera start failed: \(error.localizedDescription)")
+            return
+        }
+        // A stop() during the start (the user unlocked another way) already stopped the session:
+        // do not hand a dead session to the lock screen's preview.
+        guard current == generation, !Task.isCancelled else {
+            camera.stop()
             return
         }
         onEvent(.cameraReady(camera.session))
