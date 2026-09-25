@@ -1,0 +1,20 @@
+.build/
+dist/
+**/.DS_Store
+.swiftpm/
+.codegraph/
+.claude/
+*.p12
+*.cer
+*.pem
+*.key
+*.mobileprovision
+
+# Kept local: a full security audit of a lock app is a roadmap for attacking it.
+AUDIT.md
+security-audit-display-hotplug.md
+# Internal workflow notes, unrelated to SoftLock itself.
+docs/agent-vm-runbook.md
+# InsightFace's ArcFace weights are licensed for non-commercial research only, so they are
+# not redistributed here. Run scripts/convert_arcface.py to produce Models/ArcFace.mlpackage.
+Models/
