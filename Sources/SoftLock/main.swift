@@ -26,6 +26,13 @@ private enum Changelog {
 
     static let entries: [Entry] = [
         Entry(
+            version: "0.5.3",
+            date: "2026-09-29",
+            changes: [
+                "A video lock-screen background no longer keeps playing in the background after you unlock. It stops when the lock screen goes away and starts again the next time you lock, so SoftLock no longer uses CPU while idle."
+            ]
+        ),
+        Entry(
             version: "0.5.2",
             date: "2026-09-25",
             changes: [
@@ -3415,6 +3422,7 @@ private final class LockVideoBackgroundView: NSView {
     private let player: AVPlayer
     private let playerLayer = AVPlayerLayer()
     private var observer: NSObjectProtocol?
+    private var occlusionObserver: NSObjectProtocol?
 
     init(url: URL) {
         self.player = AVPlayer(url: url)
@@ -3440,6 +3448,9 @@ private final class LockVideoBackgroundView: NSView {
         if let observer {
             NotificationCenter.default.removeObserver(observer)
         }
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+        }
     }
 
     override func layout() {
@@ -3447,9 +3458,33 @@ private final class LockVideoBackgroundView: NSView {
         playerLayer.frame = bounds
     }
 
+    // Unlock only orders the lock windows out; they (and this view) stay alive until the next
+    // lock. Keying playback off the window alone kept the video decoding in the background
+    // for the whole session, so follow the window's visibility instead.
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window == nil ? player.pause() : player.play()
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+            self.occlusionObserver = nil
+        }
+        if let window {
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updatePlayback() }
+            }
+        }
+        updatePlayback()
+    }
+
+    private func updatePlayback() {
+        if let window, window.occlusionState.contains(.visible) {
+            player.play()
+        } else {
+            player.pause()
+        }
     }
 }
 

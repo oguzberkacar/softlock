@@ -10,8 +10,8 @@ ENTITLEMENTS_PATH="${SOFTLOCK_ENTITLEMENTS:-$ROOT_DIR/scripts/SoftLock.entitleme
 
 # Bump these when cutting a release, together with the top entry of `Changelog.entries` in
 # Sources/SoftLock/main.swift and of CHANGELOG.md. The three are cross-checked below.
-APP_VERSION="0.5.2"
-APP_BUILD="9"
+APP_VERSION="0.5.3"
+APP_BUILD="10"
 
 SIGN_CERT_NAME="${SOFTLOCK_SIGN_CERT_NAME:-SoftLock Self-Signed}"
 # Sparkle auto-update. The feed is an asset of the GitHub release, so the URL stays constant

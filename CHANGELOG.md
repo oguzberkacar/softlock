@@ -5,6 +5,14 @@ All notable changes to SoftLock are documented here. This file mirrors the in-ap
 `Sources/SoftLock/main.swift`. Keep both in sync when cutting a release, and bump
 `CFBundleShortVersionString` in `scripts/package-app.sh` to match.
 
+## 0.5.3 — 2026-09-29
+
+- A video lock-screen background no longer keeps playing after you unlock. Unlocking only
+  hides the lock windows, and the video followed whether it was in a window, not whether that
+  window was on screen, so it kept decoding in the background from the first lock onwards and
+  cost several percent CPU while idle. Playback now follows the window's visibility: it stops
+  when the lock screen goes away and starts again on the next lock.
+
 ## 0.5.2 — 2026-09-25
 
 - Fixed a crash that quit SoftLock while the lock screen was up. Starting the camera and
