@@ -46,34 +46,41 @@ press your preferred combination. It works system-wide, even when SoftLock isn't
 
 If you forget the password, enter the recovery code on the lock screen. SoftLock unlocks and asks you to create a new password.
 
-Use **Settings...** from the menu bar to customize:
+**Settings...** (menu bar) is laid out like macOS System Settings, in five panes:
 
-- Lock screen title
-- Background effect: transparent, percentage blur, solid color palette, or a custom image/video; the Apple picker separates Photos/Videos and shows macOS desktop pictures, `.madesktop` thumbnails, bundled wallpaper videos, and downloaded Apple aerial videos as previews
-- Input appearance: light, dark, or automatic contrast selection. In transparent/blur modes, automatic mode samples each display before the lock overlay appears.
-- Liquid glass inputs: optional glass-styled settings and lock-screen inputs; off by default.
-- Open at Login
-- A global lock shortcut (default ⌃⌥⌘L), recordable in Settings
-- Unlock with Touch ID (on Macs with a Touch ID sensor)
-- Optional Unlock with Face (off by default; weaker than Touch ID, see below)
-- Capture a local camera photo after failed unlock attempts
-- Maximum number of failed-attempt photos to keep
+- **General**: Lock Now, Open at Login, lock shortcuts (more than one allowed, recordable), software updates
+- **Lock Screen**: title, background (transparent, blur, colour, or an image/video including macOS wallpapers), input appearance (light, dark, or automatic contrast), liquid glass inputs, which display shows the passcode
+- **Unlock**: passcode or PIN, Touch ID (and whether its prompt appears when locked), face unlock (enrol, test, delete, camera, auto-scan, liveness)
+- **Privacy**: failed-attempt photos and how many to keep, and the Accessibility, Screen Recording and Camera permissions with Grant buttons
+- **About**: version, What's New, reset all settings, delete SoftLock
+
+## Several displays
+
+Every display is covered, and every display can take the passcode. Click a display and the
+passcode field moves there with whatever you already typed. When the lock goes up it appears on
+the display you chose in **Lock Screen → Show passcode on**; on **Automatic** that is the
+built-in display when face unlock uses the built-in camera (the camera looks at you from
+there), otherwise the display under the pointer. Unplugging the display that hosts the passcode
+moves it to another one.
 
 The lock screen footer always shows `softlock by oguzberkacar`.
 
 ## Touch ID
 
 On a Mac with Touch ID (built-in or Magic Keyboard), SoftLock can unlock with your
-fingerprint. Enable **Unlock with Touch ID** in Settings. When the screen locks, the
-system Touch ID prompt appears automatically; you can also tap **Unlock with Touch ID**
-on the lock screen. Your password always remains available as a fallback.
+fingerprint. Enable **Unlock with Touch ID** in Settings → Unlock. The passcode field is always
+ready to type. With the field empty, press the **Touch ID key** (Return by default, changeable) or
+tap **Use Touch ID** and the system fingerprint prompt opens at once; the keypad has a fingerprint
+key too. macOS has no public API to read the sensor without that prompt, so an app cannot listen
+silently the way the login window does. **Open Touch ID automatically when locked** (off by
+default) shows the prompt the moment the Mac locks. Your password always remains available.
 
 Touch ID and saved permission grants rely on a stable code signature, so the app bundle
 is signed with a fixed identifier (`com.softlock.agent-shield`) by `scripts/package-app.sh`.
 
 ## Unlock with Face (optional, off by default)
 
-Settings → Security → **Unlock with Face**. Enroll once with a guided capture (center, both
+Settings → Unlock → **Unlock with Face**. Enroll once with a guided capture (center, both
 sides, tilt up and down), then turn it on. On the lock screen SoftLock looks for you with the
 camera and unlocks the same way Touch ID does. The passcode, PIN and recovery code always keep
 working.
@@ -82,7 +89,7 @@ The scan is manual by default: the lock screen shows a camera button, and pressi
 starts a scan too (Space is only taken as the shortcut while the passcode field is empty, so
 spaces inside a password still type). This is deliberate — with automatic scanning, locking the
 Mac and walking away lets the camera catch you on the way out and unlock right again. Turn on
-**Scan automatically when locked** in Settings → Security if you want the old behaviour.
+**Scan automatically when locked** in Settings → Unlock if you want the old behaviour.
 
 How it works: Vision finds the face and 5 landmarks, the face is aligned to 112x112, and an
 on-device ArcFace (`w600k_mbf`) Core ML model turns it into a 512-number signature that is
@@ -98,8 +105,12 @@ nothing, but they cannot rule out a replayed video or a good mask. Use it for co
 
 Privacy: only the encrypted signatures are stored (AES-GCM; the key lives in the login
 Keychain, this device only) in `~/Library/Application Support/com.softlock.agent-shield/face-profile.enc`.
-Camera frames are analyzed in memory and never written to disk (the separate failed-attempt
-photo feature is unchanged). **Delete Face Data** in Settings removes the file and the key.
+Pick the camera under **Camera** (an external webcam works for a closed MacBook). Camera frames are analyzed in memory and not written to disk, unless you turn on **Keep a photo of
+every face scan** (off by default): then each scan that sees a face is saved as an AES-GCM sealed photo
+(same Keychain key, newest 60 kept) with its similarity score. **Scan history → Review** lists them:
+**This is me** adds that face to the enrolled face so face unlock learns from real, hard-angle frames
+(refused when the face does not resemble the enrolled one), **Not me** deletes it. The separate
+failed-attempt photo feature is unchanged. **Delete Face Data** in Settings removes the file and the key.
 The camera permission is requested from Settings, not from the lock screen.
 
 The model is not compiled by `swift build`. `scripts/package-app.sh` compiles

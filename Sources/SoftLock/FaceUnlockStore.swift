@@ -61,6 +61,13 @@ nonisolated enum FaceUnlockStore {
         FileManager.default.fileExists(atPath: fileURL.path)
     }
 
+    /// When the profile file was last written. Read from the file, not the profile: opening and
+    /// decrypting it needs the Keychain key, and Settings must not trigger a Keychain prompt
+    /// just to show a date.
+    static var profileModifiedAt: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
+    }
+
     /// nil when nothing is enrolled. Throws when data exists but cannot be decrypted (for
     /// example the Keychain key was removed), which callers treat as "not enrolled".
     static func load() throws -> FaceProfile? {
@@ -85,10 +92,32 @@ nonisolated enum FaceUnlockStore {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     }
 
-    /// Removes the encrypted file and the Keychain key.
+    /// Removes the encrypted file, the stored scans and the Keychain key.
     static func eraseAll() {
         try? FileManager.default.removeItem(at: fileURL)
+        FaceScanLog.eraseAll()
         SecItemDelete(baseQuery() as CFDictionary)
+    }
+
+    private static let scanAAD = Data("softlock.face-scan.v1".utf8)
+
+    /// Seals arbitrary data (a stored scan) under the same Keychain key as the profile, with its
+    /// own authenticated-data tag so a scan file can never be opened as a profile or vice versa.
+    static func sealScan(_ plain: Data) throws -> Data {
+        let key = try existingKey() ?? createKey()
+        guard let combined = try AES.GCM.seal(plain, using: key, authenticating: scanAAD).combined else {
+            throw FaceUnlockStoreError.corrupt
+        }
+        return combined
+    }
+
+    static func openScan(_ sealed: Data) throws -> Data {
+        guard let key = try existingKey() else { throw FaceUnlockStoreError.corrupt }
+        do {
+            return try AES.GCM.open(try AES.GCM.SealedBox(combined: sealed), using: key, authenticating: scanAAD)
+        } catch {
+            throw FaceUnlockStoreError.corrupt
+        }
     }
 
     // MARK: - Keychain

@@ -53,6 +53,33 @@ final class FaceCameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         AVCaptureDevice.authorizationStatus(for: .video)
     }
 
+    /// Every camera the Mac can capture from right now, built-in first. Continuity Camera
+    /// (an iPhone) is included: it is a legitimate choice for a desk setup.
+    static func availableDevices() -> [AVCaptureDevice] {
+        var types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .external]
+        if #available(macOS 14.0, *) { types.append(.continuityCamera) }
+        let session = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified)
+        return session.devices
+    }
+
+    /// The camera face unlock (and the failed-attempt photo) should use: the one chosen in
+    /// Settings when it is still connected, otherwise the built-in camera, otherwise whatever
+    /// the system considers the default. A chosen camera that is unplugged falls back instead
+    /// of failing, so a forgotten webcam never locks the owner out of face unlock.
+    static func resolveDevice(preferredUniqueID: String?) -> AVCaptureDevice? {
+        if let preferredUniqueID, let chosen = availableDevices().first(where: { $0.uniqueID == preferredUniqueID }) {
+            return chosen
+        }
+        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified)
+            ?? AVCaptureDevice.default(for: .video)
+    }
+
+    /// True for the camera above the built-in display (FaceTime HD / Center Stage), the one
+    /// case where "the display with the camera" is knowable.
+    static func isBuiltIn(_ device: AVCaptureDevice?) -> Bool {
+        device?.deviceType == .builtInWideAngleCamera
+    }
+
     /// Prompts only when undetermined. Call from Settings, never from the lock screen (the
     /// system prompt would appear behind the lock windows).
     static func requestAccess() async -> Bool {
@@ -71,18 +98,21 @@ final class FaceCameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     /// still walking those connections on the camera queue throws a collection-mutation
     /// exception from inside AVFoundation, which aborts the process. Every session mutation
     /// therefore happens on `queue`, and nothing else touches the session until it is done.
-    func start() async throws {
+    func start(preferredDeviceUniqueID: String? = nil) async throws {
         guard Self.authorizationStatus == .authorized else { throw FaceCameraError.notAuthorized }
         resetFrameState()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
                 do {
-                    try configureIfNeeded()
+                    try configureIfNeeded(preferredDeviceUniqueID: preferredDeviceUniqueID)
                 } catch {
                     continuation.resume(throwing: error)
                     return
                 }
                 if !session.isRunning { session.startRunning() }
+                // Warm-up counts from when frames can start flowing, not from before the
+                // (blocking) startRunning: otherwise the dark first frames slip through.
+                restartWarmUp()
                 continuation.resume()
             }
         }
@@ -108,6 +138,13 @@ final class FaceCameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         lock.unlock()
     }
 
+    private func restartWarmUp() {
+        lock.lock()
+        latest = nil
+        warmUpDeadline = Date().addingTimeInterval(Self.warmUpDuration)
+        lock.unlock()
+    }
+
     /// The newest frame, or nil while the camera is still warming up (auto-exposure settling).
     func latestFrame() -> FaceCameraFrame? {
         lock.lock()
@@ -122,20 +159,25 @@ final class FaceCameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         return Date() < warmUpDeadline
     }
 
-    private func configureIfNeeded() throws {
-        guard !configured else { return }
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified)
-            ?? AVCaptureDevice.default(for: .video) else {
+    /// Runs on `queue`. Configures once; afterwards only swaps the input when the wanted camera
+    /// changed (the user picked another one in Settings, or the chosen one was unplugged).
+    private func configureIfNeeded(preferredDeviceUniqueID: String?) throws {
+        guard let device = Self.resolveDevice(preferredUniqueID: preferredDeviceUniqueID) else {
             throw FaceCameraError.noDevice
         }
+        let currentInput = session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.first
+        if configured, currentInput?.device.uniqueID == device.uniqueID { return }
+
         let input = try AVCaptureDeviceInput(device: device)
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+        if let currentInput { session.removeInput(currentInput) }
         session.sessionPreset = .high
         guard session.canAddInput(input) else { throw FaceCameraError.cannotConfigure }
         session.addInput(input)
 
+        guard !configured else { return }
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: queue)

@@ -160,13 +160,13 @@ final class FaceRecognitionTestWindowController: NSObject, NSWindowDelegate {
             return
         }
         guard let profile, profile.modelIdentifier == ArcFaceEmbedder.modelIdentifier, let template = profile.template else {
-            finishRun(passed: false, headline: "No face enrolled", scores: " ", detail: "Set up your face in Settings > Security first.")
+            finishRun(passed: false, headline: "No face enrolled", scores: " ", detail: "Set up your face in Settings > Unlock first.")
             return
         }
         let embedder: ArcFaceEmbedder
         do {
             embedder = try await Task.detached(priority: .userInitiated) { try ArcFaceEmbedder() }.value
-            try await camera.start()
+            try await camera.start(preferredDeviceUniqueID: FaceUnlockSettings.shared.cameraUniqueID)
         } catch {
             finishRun(passed: false, headline: "Camera problem", scores: " ", detail: error.localizedDescription)
             return

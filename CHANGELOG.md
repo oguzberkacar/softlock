@@ -5,6 +5,15 @@ All notable changes to SoftLock are documented here. This file mirrors the in-ap
 `Sources/SoftLock/main.swift`. Keep both in sync when cutting a release, and bump
 `CFBundleShortVersionString` in `scripts/package-app.sh` to match.
 
+## 0.6.0 — 2026-10-02
+
+- Settings rebuilt to look and work like macOS System Settings: a sidebar with five panes (General, Lock Screen, Unlock, Privacy, About) and grouped forms. Unlock options (passcode, Touch ID, face) now live together instead of being split across panes, and failed-attempt photos moved to Privacy next to the permissions they need.
+- Touch ID no longer covers the passcode field when the Mac locks. The field is ready to type, and a key you choose (Return by default, set in Settings → Unlock) opens the fingerprint prompt at once while the field is empty; tapping Use Touch ID or the keypad's fingerprint key works too. macOS has no public way to read the sensor without its prompt, so silent listening is not possible. Open Touch ID automatically when locked brings the old behaviour back.
+- With several displays you can now type your passcode on any of them: click a display and the passcode moves there, keeping what you already typed. Settings → Lock Screen → Show passcode on pins one display. Automatic uses the built-in display when face unlock looks through the built-in camera, otherwise the display under the pointer.
+- New optional face scan history (Settings → Unlock → Keep a photo of every face scan, off by default). Each scan that sees a face is saved as an encrypted photo with its similarity score. Review them under Scan history: This is me teaches face unlock from that scan, Not me deletes it. A face that does not resemble your enrolled face is refused, so a mis-click cannot teach it to accept someone else.
+- Face unlock can use an external camera (Settings → Unlock → Camera), for a closed MacBook or a better webcam. Failed-attempt photos use the same camera.
+- Fixed: a space typed in a password while a face scan was running was swallowed. A late Touch ID result could re-show the lock screen after you had already unlocked. A face scan kept running during the too-many-attempts wait and could announce a match it then refused. A display plugged in mid-lock could steal keyboard focus. Face unlock failures now say why instead of staying silent. Closing Settings while recording a shortcut left the lock shortcut disabled. Reset all settings put the old lock title back and missed face options. Camera now counts as needed when face unlock is on. Shortcuts no longer store Caps Lock or fn flags. A corrupt password file could crash the lock screen.
+
 ## 0.5.3 — 2026-09-29
 
 - A video lock-screen background no longer keeps playing after you unlock. Unlocking only

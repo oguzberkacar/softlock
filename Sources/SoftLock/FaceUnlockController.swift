@@ -24,7 +24,31 @@ final class FaceUnlockSettings {
     private let enabledKey = "faceUnlockEnabled"
     private let livenessKey = "faceUnlockLiveness"
     private let autoScanKey = "faceUnlockAutoScan"
+    private let cameraKey = "faceUnlockCameraID"
+    private let keepScansKey = "faceUnlockKeepScans"
     private let defaults = UserDefaults.standard
+
+    /// Keep an encrypted photo of every face scan for review and for improving face unlock
+    /// (see FaceScanLog). Off by default: it stores biometric photos on disk.
+    var keepScanPhotos: Bool {
+        get { defaults.bool(forKey: keepScansKey) }
+        set {
+            defaults.set(newValue, forKey: keepScansKey)
+            NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
+        }
+    }
+
+    /// `AVCaptureDevice.uniqueID` of the camera to scan with; nil means the built-in camera
+    /// (or the system default when there is none). Lets a MacBook in clamshell mode, or a Mac
+    /// with a better webcam, use the camera that actually sees the user. A chosen camera that
+    /// is unplugged falls back to the default instead of failing (see `FaceCameraFeed.resolveDevice`).
+    var cameraUniqueID: String? {
+        get { defaults.string(forKey: cameraKey) }
+        set {
+            if let newValue { defaults.set(newValue, forKey: cameraKey) } else { defaults.removeObject(forKey: cameraKey) }
+            NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
+        }
+    }
 
     /// Light (glance's own default) is deny-only: it blocks a face that looks like a photo or a
     /// screen, but never blocks an owner who sits perfectly still. Heavy also demands a blink or a
@@ -197,6 +221,7 @@ final class FaceUnlockController {
             profile = try FaceUnlockStore.load()
         } catch {
             AppFaceLog.write("face unlock: profile unreadable: \(error.localizedDescription)")
+            onEvent(.status("Face data could not be read. Use your passcode.", .warning))
             return
         }
         guard let profile, profile.modelIdentifier == ArcFaceEmbedder.modelIdentifier,
@@ -207,14 +232,16 @@ final class FaceUnlockController {
             embedder = try await Task.detached(priority: .userInitiated) { try ArcFaceEmbedder() }.value
         } catch {
             AppFaceLog.write("face unlock: model load failed: \(error.localizedDescription)")
+            onEvent(.status("Face unlock is unavailable. Use your passcode.", .warning))
             return
         }
         guard current == generation else { return }
 
         do {
-            try await camera.start()
+            try await camera.start(preferredDeviceUniqueID: FaceUnlockSettings.shared.cameraUniqueID)
         } catch {
             AppFaceLog.write("face unlock: camera start failed: \(error.localizedDescription)")
+            onEvent(.status("The camera could not start. Use your passcode.", .warning))
             return
         }
         // A stop() during the start (the user unlocked another way) already stopped the session:
@@ -289,6 +316,8 @@ final class FaceUnlockController {
         var sawFace = false
         var judgedFrames = 0
         var lastJudgedFrame: FaceCameraFrame?
+        var lastEmbedding: [Float]?
+        var lastScore: Float?
         var promptedLiveness = false
 
         while Date() < deadline, current == generation, !Task.isCancelled {
@@ -341,6 +370,9 @@ final class FaceUnlockController {
             let matched = policy.isMatch(score)
             judgedFrames += 1
             lastJudgedFrame = frame
+            lastEmbedding = result.embedding
+            // The unlock rule needs both numbers over the threshold, so the lower one is the real score.
+            lastScore = min(score.centroidSimilarity, score.maxSampleSimilarity)
             let decision = decider.observe(.face(matched: matched, liveness: verdict))
             switch decision {
             case .pending:
@@ -352,22 +384,38 @@ final class FaceUnlockController {
                 }
                 continue
             case .unlock:
+                logScan(.unlocked, frame: frame, score: lastScore, embedding: lastEmbedding)
                 onEvent(.state(.recognized))
                 onEvent(.status("Face recognized.", .success))
                 try? await Task.sleep(for: Self.successBeat)
                 guard current == generation, !Task.isCancelled else { return .cancelled }
                 return onUnlock() ? .unlocked : .cancelled
             case .rejectedWrongFace, .rejectedSpoof:
+                logScan(decision == .rejectedSpoof ? .spoofSuspected : .notRecognized, frame: lastJudgedFrame, score: lastScore, embedding: lastEmbedding)
                 AppFaceLog.write("face reject: \(decision) score=\(score) matched=\(matched) liveness=\(verdict) snapshot=\(snapshot)")
                 return .rejected(lastJudgedFrame)
             }
         }
         switch FaceScanTimeoutOutcome.classify(sawFace: sawFace, judgedFrames: judgedFrames, awaitingLiveness: decider.isAwaitingLiveness) {
-        case .noFace: return .noFaceSeen
-        case .noClearFrame: return .noClearFrame
-        case .needsLiveness: return .needsLiveness
-        case .notRecognized: return .rejected(lastJudgedFrame)
+        case .noFace:
+            return .noFaceSeen
+        case .noClearFrame:
+            logScan(.unconfirmed, frame: lastJudgedFrame, score: lastScore, embedding: lastEmbedding)
+            return .noClearFrame
+        case .needsLiveness:
+            logScan(.unconfirmed, frame: lastJudgedFrame, score: lastScore, embedding: lastEmbedding)
+            return .needsLiveness
+        case .notRecognized:
+            logScan(.notRecognized, frame: lastJudgedFrame, score: lastScore, embedding: lastEmbedding)
+            return .rejected(lastJudgedFrame)
         }
+    }
+
+    /// One stored scan per ended scan cycle that actually saw a face, when the owner turned the
+    /// scan history on. Nobody in front of the camera is not worth a photo.
+    private func logScan(_ outcome: FaceScanOutcome, frame: FaceCameraFrame?, score: Float?, embedding: [Float]?) {
+        guard FaceUnlockSettings.shared.keepScanPhotos, let frame else { return }
+        FaceScanLog.record(frame: frame, outcome: outcome, score: score, embedding: embedding)
     }
 }
 

@@ -17,7 +17,7 @@ private let appIdentifier = "com.softlock.agent-shield"
 /// Single source of truth for release notes. The newest entry comes first; the About pane
 /// renders this list, and `CHANGELOG.md` mirrors it. Bump `CFBundleShortVersionString` in
 /// `scripts/package-app.sh` to match the top entry when cutting a release.
-private enum Changelog {
+enum Changelog {
     struct Entry {
         let version: String
         let date: String
@@ -25,6 +25,18 @@ private enum Changelog {
     }
 
     static let entries: [Entry] = [
+        Entry(
+            version: "0.6.0",
+            date: "2026-10-02",
+            changes: [
+                "Settings rebuilt to look and work like macOS System Settings: a sidebar with five panes (General, Lock Screen, Unlock, Privacy, About) and grouped forms. Unlock options (passcode, Touch ID, face) now live together instead of being split across panes, and failed-attempt photos moved to Privacy next to the permissions they need.",
+                "Touch ID no longer covers the passcode field when the Mac locks. The field is ready to type, and a key you choose (Return by default, set in Settings → Unlock) opens the fingerprint prompt at once while the field is empty; tapping Use Touch ID or the keypad's fingerprint key works too. macOS has no public way to read the sensor without its prompt, so silent listening is not possible. Open Touch ID automatically when locked brings the old behaviour back.",
+                "With several displays you can now type your passcode on any of them: click a display and the passcode moves there, keeping what you already typed. Settings → Lock Screen → Show passcode on pins one display. Automatic uses the built-in display when face unlock looks through the built-in camera, otherwise the display under the pointer.",
+                "New optional face scan history (Settings → Unlock → Keep a photo of every face scan, off by default). Each scan that sees a face is saved as an encrypted photo with its similarity score. Review them under Scan history: This is me teaches face unlock from that scan, Not me deletes it. A face that does not resemble your enrolled face is refused, so a mis-click cannot teach it to accept someone else.",
+                "Face unlock can use an external camera (Settings → Unlock → Camera), for a closed MacBook or a better webcam. Failed-attempt photos use the same camera.",
+                "Fixed: a space typed in a password while a face scan was running was swallowed. A late Touch ID result could re-show the lock screen after you had already unlocked. A face scan kept running during the too-many-attempts wait and could announce a match it then refused. A display plugged in mid-lock could steal keyboard focus. Face unlock failures now say why instead of staying silent. Closing Settings while recording a shortcut left the lock shortcut disabled. Reset all settings put the old lock title back and missed face options. Camera now counts as needed when face unlock is on. Shortcuts no longer store Caps Lock or fn flags. A corrupt password file could crash the lock screen."
+            ]
+        ),
         Entry(
             version: "0.5.3",
             date: "2026-09-29",
@@ -153,7 +165,7 @@ final class IdleSleepGuard {
     }
 }
 
-private enum PermissionKind {
+enum PermissionKind {
     case accessibility
     case screenRecording
     case camera
@@ -168,7 +180,7 @@ private enum PermissionKind {
     }
 }
 
-private struct PermissionStatus {
+struct PermissionStatus {
     let name: String
     let kind: PermissionKind
     let ok: Bool
@@ -184,7 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var locker: LockerController?
     private var setupWindow: SetupWindowController?
-    private var mainWindow: MainWindowController?
+    private var mainWindow: SettingsWindowController?
     private var isLocked = false
     private var observedVerifiedMacOSLock = false
     private let idleSleepGuard = IdleSleepGuard()
@@ -231,7 +243,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            if !self.store.isConfigured {
+            if let flag = CommandLine.arguments.first(where: { $0.hasPrefix("--open-settings") }) {
+                // Developer aid: straight to Settings (no passcode prompt), for checking layout.
+                // `--open-settings=unlock` lands on a pane.
+                self.showMain()
+                let pane = flag.split(separator: "=", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
+                if let pane = SettingsModel.Pane(rawValue: pane) {
+                    self.mainWindow?.model.selection = pane
+                }
+            } else if !self.store.isConfigured {
                 self.showPasswordSetup()
             }
         }
@@ -398,7 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isLocked else { return }
 
         if mainWindow == nil {
-            mainWindow = MainWindowController(
+            mainWindow = SettingsWindowController(
                 settings: AppSettings.shared,
                 onLock: { [weak self] in self?.lockNow() },
                 onChangePasscode: { [weak self] in self?.showPasswordSetup() },
@@ -466,1361 +486,6 @@ private enum SoftLockMain {
     }
 }
 
-@MainActor
-private final class MainWindowController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
-    private let settings: AppSettings
-    private let onLock: () -> Void
-    private let onChangePasscode: () -> Void
-    private let onDeleteApp: () -> Void
-    private let window: NSWindow
-
-    private let titleField = NSTextField()
-    private let backgroundKindPopup = NSPopUpButton()
-    private let blurSlider = NSSlider(value: 0.0, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
-    private let blurValueLabel = NSTextField(labelWithString: "")
-    private let backgroundColorStack = NSStackView()
-    private var backgroundColorButtons: [NSButton] = []
-    private let backgroundMediaButton = NSButton(title: "Choose...", target: nil, action: nil)
-    private let appleWallpapersButton = NSButton(title: "Apple...", target: nil, action: nil)
-    private let backgroundMediaClearButton = NSButton(title: "Clear", target: nil, action: nil)
-    private let backgroundMediaLabel = NSTextField(labelWithString: "")
-    private let inputAppearancePopup = NSPopUpButton()
-    private let liquidGlassInputsSwitch = NSSwitch()
-    private let launchAtLoginSwitch = NSSwitch()
-    private let launchAtLoginStatusLabel = NSTextField(labelWithString: "")
-    private let launchAtLoginSettingsButton = NSButton(title: "Open Settings...", target: nil, action: nil)
-    private var shortcutRecorders: [ShortcutRecorderView] = []
-    private let touchIDSwitch = NSSwitch()
-    private let captureSwitch = NSSwitch()
-    private let maxPhotosStepper = NSStepper()
-    private let maxPhotosLabel = NSTextField(labelWithString: "")
-    private let permissionsStack = NSStackView()
-
-    private let headerLabel = NSTextField(labelWithString: "")
-    private let contentContainer = NSView()
-    private var sidebarItems: [NSView] = []
-    private var sidebarLabels: [NSTextField] = []
-    private var selectedIndex = 0
-    private var launchAtLoginError: String?
-    private var wallpaperPicker: WallpaperPickerWindowController?
-    private var appearanceObservation: NSKeyValueObservation?
-    private var titleFieldSizeConstraints: [NSLayoutConstraint] = []
-
-    private struct Pane {
-        let title: String
-        let symbol: String
-        let tint: NSColor
-    }
-
-    private let panes: [Pane] = [
-        Pane(title: "General", symbol: "gearshape.fill", tint: .systemGray),
-        Pane(title: "Security", symbol: "lock.shield.fill", tint: .systemBlue),
-        Pane(title: "About", symbol: "info.circle.fill", tint: .systemTeal)
-    ]
-
-    init(
-        settings: AppSettings,
-        onLock: @escaping () -> Void,
-        onChangePasscode: @escaping () -> Void,
-        onDeleteApp: @escaping () -> Void
-    ) {
-        self.settings = settings
-        self.onLock = onLock
-        self.onChangePasscode = onChangePasscode
-        self.onDeleteApp = onDeleteApp
-        self.window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
-            styleMask: [.titled, .closable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        super.init()
-        build()
-    }
-
-    func show() {
-        // Refresh the visible pane so values reflect any external changes.
-        selectPane(selectedIndex)
-        // Only place the window when it first appears — re-centering an already-open window
-        // (e.g. picking "Settings" from the menu again) made it jump under the user.
-        if !window.isVisible {
-            window.centerOnActiveScreen()
-        }
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func build() {
-        window.title = "SoftLock"
-        window.titlebarAppearsTransparent = true
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-        window.titleVisibility = .hidden
-
-        // Card fills/borders are baked into CALayers as fixed CGColors, so a light/dark switch
-        // while the window is open would leave them stale. Rebuild the pane when it flips.
-        appearanceObservation = window.observe(\.effectiveAppearance) { [weak self] _, _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.window.effectiveAppearance.performAsCurrentDrawingAppearance {
-                    self.selectPane(self.selectedIndex)
-                }
-            }
-        }
-
-        let sidebar = makeSidebar()
-        let content = makeContentArea()
-
-        let root = NSView()
-        root.addSubview(sidebar)
-        root.addSubview(content)
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
-        content.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView = root
-
-        NSLayoutConstraint.activate([
-            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            sidebar.topAnchor.constraint(equalTo: root.topAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 200),
-            content.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            content.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            content.topAnchor.constraint(equalTo: root.topAnchor),
-            content.bottomAnchor.constraint(equalTo: root.bottomAnchor)
-        ])
-
-        selectPane(0)
-    }
-
-    // MARK: - Sidebar
-
-    private func makeSidebar() -> NSView {
-        let backing = NSVisualEffectView()
-        backing.material = .sidebar
-        backing.blendingMode = .behindWindow
-        backing.state = .active
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        for (index, pane) in panes.enumerated() {
-            let item = makeSidebarItem(pane: pane, index: index)
-            sidebarItems.append(item)
-            stack.addArrangedSubview(item)
-            item.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            item.heightAnchor.constraint(equalToConstant: 34).isActive = true
-        }
-
-        backing.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: backing.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: backing.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: backing.topAnchor, constant: 52)
-        ])
-        return backing
-    }
-
-    private func makeSidebarItem(pane: Pane, index: Int) -> NSView {
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.cornerRadius = 8
-        container.layer?.cornerCurve = .continuous
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let tile = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-        let image = NSImage(systemSymbolName: pane.symbol, accessibilityDescription: pane.title)?
-            .withSymbolConfiguration(tile)
-        let imageView = NSImageView(image: image ?? NSImage())
-        imageView.wantsLayer = true
-        imageView.layer?.backgroundColor = pane.tint.cgColor
-        imageView.layer?.cornerRadius = 6
-        imageView.layer?.cornerCurve = .continuous
-        imageView.contentTintColor = .white
-        // Keep the glyph centred and proportionally inset so the tile reads as a clean 1:1
-        // square (the colored background is square; the symbol sits symmetrically inside it).
-        imageView.imageScaling = .scaleProportionallyDown
-        imageView.imageAlignment = .alignCenter
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-
-        let label = NSTextField(labelWithString: pane.title)
-        label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.translatesAutoresizingMaskIntoConstraints = false
-        sidebarLabels.append(label)
-
-        let row = NSStackView(views: [imageView, label])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 9
-        row.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(row)
-
-        let button = NSButton(title: "", target: self, action: #selector(sidebarItemClicked(_:)))
-        button.tag = index
-        button.isBordered = false
-        button.isTransparent = true
-        button.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(button)
-
-        NSLayoutConstraint.activate([
-            imageView.widthAnchor.constraint(equalToConstant: 22),
-            imageView.heightAnchor.constraint(equalToConstant: 22),
-            row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
-            row.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            button.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            button.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            button.topAnchor.constraint(equalTo: container.topAnchor),
-            button.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-        return container
-    }
-
-    @objc private func sidebarItemClicked(_ sender: NSButton) {
-        selectPane(sender.tag)
-    }
-
-    private func selectPane(_ index: Int) {
-        selectedIndex = index
-        for (i, item) in sidebarItems.enumerated() {
-            let selected = i == index
-            item.layer?.backgroundColor = selected ? NSColor.controlAccentColor.cgColor : NSColor.clear.cgColor
-            if i < sidebarLabels.count {
-                sidebarLabels[i].textColor = selected ? .white : .labelColor
-            }
-        }
-        headerLabel.stringValue = panes[index].title
-
-        contentContainer.subviews.forEach { $0.removeFromSuperview() }
-        let pane: NSView
-        switch index {
-        case 0: pane = buildGeneralPane()
-        case 1: pane = buildSecurityPane()
-        default: pane = buildAboutPane()
-        }
-        pane.translatesAutoresizingMaskIntoConstraints = false
-
-        // The General/About panes are taller than the window once a few shortcuts are added,
-        // so host the pane in a scroll view instead of letting it run off the bottom edge.
-        // The flipped document keeps the pane pinned to the top.
-        let document = FlippedView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(pane)
-
-        let scroll = NSScrollView()
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = document
-        contentContainer.addSubview(scroll)
-
-        NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
-            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            pane.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 28),
-            pane.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor, constant: -28),
-            pane.topAnchor.constraint(equalTo: document.topAnchor, constant: 6),
-            pane.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24)
-        ])
-    }
-
-    // MARK: - Content area
-
-    private func makeContentArea() -> NSView {
-        let backing = NSVisualEffectView()
-        backing.material = .contentBackground
-        backing.blendingMode = .behindWindow
-        backing.state = .active
-
-        headerLabel.font = .systemFont(ofSize: 28, weight: .bold)
-        headerLabel.textColor = .labelColor
-        headerLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        contentContainer.translatesAutoresizingMaskIntoConstraints = false
-        backing.addSubview(headerLabel)
-        backing.addSubview(contentContainer)
-
-        NSLayoutConstraint.activate([
-            headerLabel.leadingAnchor.constraint(equalTo: backing.leadingAnchor, constant: 28),
-            headerLabel.topAnchor.constraint(equalTo: backing.topAnchor, constant: 42),
-            contentContainer.leadingAnchor.constraint(equalTo: backing.leadingAnchor),
-            contentContainer.trailingAnchor.constraint(equalTo: backing.trailingAnchor),
-            contentContainer.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 16),
-            contentContainer.bottomAnchor.constraint(equalTo: backing.bottomAnchor)
-        ])
-        return backing
-    }
-
-    // MARK: - Panes
-
-    private func buildGeneralPane() -> NSView {
-        let lockButton = NSButton(title: "Lock Now", target: self, action: #selector(lockTapped))
-        lockButton.bezelStyle = .rounded
-        lockButton.controlSize = .large
-        lockButton.contentTintColor = .controlAccentColor
-
-        configure(titleField, placeholder: "Lock screen title")
-        titleField.stringValue = settings.lockTitle
-        titleField.delegate = self
-        titleField.alignment = .right
-        // Activated once: the field is reused on every pane rebuild, so re-adding the
-        // constraints each time piled up duplicates. The fixed height also stops the
-        // borderless glass style from collapsing to a single text line.
-        if titleFieldSizeConstraints.isEmpty {
-            titleFieldSizeConstraints = [
-                titleField.widthAnchor.constraint(equalToConstant: 230),
-                titleField.heightAnchor.constraint(equalToConstant: 26)
-            ]
-            NSLayoutConstraint.activate(titleFieldSizeConstraints)
-        }
-
-        let backgroundControl = makeBackgroundEffectControl()
-        let inputAppearanceControl = makeInputAppearanceControl()
-        let liquidGlassInputsControl = makeLiquidGlassInputsControl()
-        let launchAtLoginControl = makeLaunchAtLoginControl()
-
-        let pane = verticalGroups([
-            makeGroup([makeRow("Lock this Mac", control: lockButton)]),
-            makeGroup([
-                makeRow("Lock screen title", control: titleField),
-                makeRow("Background effect", control: backgroundControl, height: 156),
-                makeRow("Input appearance", control: inputAppearanceControl),
-                makeRow("Liquid glass inputs", control: liquidGlassInputsControl),
-                makeRow("Open at Login", control: launchAtLoginControl)
-            ]),
-            makeGroup(makeShortcutRows())
-        ])
-        pane.addArrangedSubview(footnote("Shortcuts work anywhere, even when SoftLock isn't focused. Add an alternate combo for keyboards with a different layout."))
-        return pane
-    }
-
-    /// One row per configured lock shortcut (recorder + remove button when there is more
-    /// than one), followed by an "add" row. Rows are rebuilt via `selectPane` whenever
-    /// shortcuts are added or removed.
-    private func makeShortcutRows() -> [NSView] {
-        shortcutRecorders = []
-        var rows: [NSView] = []
-        let shortcuts = settings.lockShortcuts
-
-        for (index, shortcut) in shortcuts.enumerated() {
-            let recorder = ShortcutRecorderView(shortcut: shortcut)
-            recorder.glassEnabled = settings.liquidGlassInputsEnabled
-            recorder.onChange = { [weak self] changed in
-                self?.shortcutChanged(changed, at: index)
-            }
-            recorder.onRecordingChange = { recording in
-                if recording {
-                    HotKeyCenter.shared.suspend()
-                } else {
-                    HotKeyCenter.shared.resume()
-                }
-            }
-            shortcutRecorders.append(recorder)
-
-            let control: NSView
-            if shortcuts.count > 1 {
-                let remove = NSButton(
-                    image: NSImage(systemSymbolName: "minus.circle.fill", accessibilityDescription: "Remove shortcut") ?? NSImage(),
-                    target: self,
-                    action: #selector(removeShortcutTapped(_:))
-                )
-                remove.tag = index
-                remove.isBordered = false
-                remove.contentTintColor = .tertiaryLabelColor
-                let stack = NSStackView(views: [recorder, remove])
-                stack.orientation = .horizontal
-                stack.spacing = 8
-                control = stack
-            } else {
-                control = recorder
-            }
-            rows.append(makeRow(index == 0 ? "Lock shortcut" : "Alternate shortcut", control: control))
-        }
-
-        let add = NSButton(title: "Add", target: self, action: #selector(addShortcutTapped))
-        add.bezelStyle = .rounded
-        rows.append(makeRow("Add another shortcut", control: add))
-        return rows
-    }
-
-    private func shortcutChanged(_ shortcut: LockShortcut, at index: Int) {
-        var all = settings.lockShortcuts
-        guard all.indices.contains(index) else { return }
-        // Refuse a combo that's already taken by another slot; revert the recorder's label.
-        if all.enumerated().contains(where: { $0.offset != index && $0.element.sameKey(as: shortcut) }) {
-            NSSound.beep()
-            if shortcutRecorders.indices.contains(index) {
-                shortcutRecorders[index].update(all[index])
-            }
-            return
-        }
-        all[index] = shortcut
-        settings.lockShortcuts = all
-    }
-
-    @objc private func addShortcutTapped() {
-        var all = settings.lockShortcuts
-        // Reuse a still-unset slot instead of stacking empty ones.
-        if let pending = all.firstIndex(where: { !$0.isSet }) {
-            if shortcutRecorders.indices.contains(pending) {
-                shortcutRecorders[pending].beginRecording()
-            }
-            return
-        }
-        all.append(.unset)
-        settings.lockShortcuts = all
-        selectPane(selectedIndex)
-        shortcutRecorders.last?.beginRecording()
-    }
-
-    @objc private func removeShortcutTapped(_ sender: NSButton) {
-        var all = settings.lockShortcuts
-        guard all.indices.contains(sender.tag) else { return }
-        all.remove(at: sender.tag)
-        settings.lockShortcuts = all
-        selectPane(selectedIndex)
-    }
-
-    private func buildSecurityPane() -> NSView {
-        let available = BiometricAuth.isAvailable
-        touchIDSwitch.state = settings.useTouchID ? .on : .off
-        touchIDSwitch.target = self
-        touchIDSwitch.action = #selector(touchIDChanged)
-        touchIDSwitch.isEnabled = available
-
-        let unlockRow = makeRow(available ? "Unlock with Touch ID" : "Unlock with Touch ID (unavailable)", control: touchIDSwitch)
-
-        let passcodeValue = NSTextField(labelWithString: passcodeDescription())
-        passcodeValue.font = .systemFont(ofSize: 13)
-        passcodeValue.textColor = .secondaryLabelColor
-        let changeButton = NSButton(title: "Change…", target: self, action: #selector(changePasscodeTapped))
-        changeButton.bezelStyle = .rounded
-        let passcodeControl = NSStackView(views: [passcodeValue, changeButton])
-        passcodeControl.spacing = 8
-
-        captureSwitch.state = settings.capturePhotoOnFailure ? .on : .off
-        captureSwitch.target = self
-        captureSwitch.action = #selector(captureChanged)
-
-        maxPhotosStepper.minValue = 1
-        maxPhotosStepper.maxValue = 100
-        maxPhotosStepper.increment = 1
-        maxPhotosStepper.integerValue = settings.maxFailedAttemptPhotos
-        maxPhotosStepper.target = self
-        maxPhotosStepper.action = #selector(maxPhotosChanged)
-        maxPhotosLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
-        maxPhotosLabel.textColor = .secondaryLabelColor
-        maxPhotosLabel.widthAnchor.constraint(equalToConstant: 70).isActive = true
-        updateMaxPhotosLabel()
-        let maxPhotosControl = NSStackView(views: [maxPhotosLabel, maxPhotosStepper])
-        maxPhotosControl.spacing = 8
-
-        let permButton = NSButton(title: "Check", target: self, action: #selector(checkPermissions))
-        permButton.bezelStyle = .rounded
-        permissionsStack.orientation = .vertical
-        permissionsStack.alignment = .trailing
-        permissionsStack.spacing = 3
-        updatePermissionsLabel()
-        let permControl = NSStackView(views: [permissionsStack, permButton])
-        permControl.spacing = 10
-        permControl.alignment = .centerY
-
-        return verticalGroups([
-            makeGroup([
-                unlockRow,
-                makeRow("Passcode", control: passcodeControl)
-            ]),
-            makeGroup([
-                FaceUnlockSettingsView()
-            ]),
-            makeGroup([
-                makeRow("Capture a photo on failed unlock", control: captureSwitch),
-                makeRow("Photos to keep", control: maxPhotosControl),
-                makeFailedPhotosRow(),
-                makeRow("Permissions", control: permControl, height: 84)
-            ])
-        ])
-    }
-
-    /// A two-line row for failed-attempt photos: the label and an Open Folder button on top,
-    /// and below them a 3-up grid of larger, clickable thumbnails of the latest captures.
-    private func makeFailedPhotosRow() -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let label = NSTextField(labelWithString: "Recent photos")
-        label.font = .systemFont(ofSize: 13)
-        label.textColor = .labelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(label)
-
-        let openButton = NSButton(title: "Open Folder…", target: self, action: #selector(openFailedAttempts))
-        openButton.bezelStyle = .rounded
-        openButton.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(openButton)
-
-        let strip = NSStackView()
-        strip.orientation = .horizontal
-        strip.spacing = 10
-        strip.alignment = .centerY
-        strip.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(strip)
-
-        let photos = FailedAttemptStore.recentPhotos(limit: 3)
-        if photos.isEmpty {
-            let empty = NSTextField(labelWithString: "No photos captured yet")
-            empty.font = .systemFont(ofSize: 12)
-            empty.textColor = .tertiaryLabelColor
-            strip.addArrangedSubview(empty)
-        } else {
-            for url in photos {
-                strip.addArrangedSubview(makePhotoThumbnail(url))
-            }
-        }
-
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
-            label.topAnchor.constraint(equalTo: row.topAnchor, constant: 14),
-            openButton.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
-            openButton.centerYAnchor.constraint(equalTo: label.centerYAnchor),
-            strip.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
-            strip.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -16),
-            strip.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 12),
-            strip.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -14)
-        ])
-        return row
-    }
-
-    private func makePhotoThumbnail(_ url: URL) -> NSView {
-        let button = NSButton(title: "", target: self, action: #selector(openPhoto(_:)))
-        button.isBordered = false
-        button.imagePosition = .imageOnly
-        button.image = NSImage(contentsOf: url)
-        button.imageScaling = .scaleProportionallyUpOrDown
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 8
-        button.layer?.cornerCurve = .continuous
-        button.layer?.masksToBounds = true
-        button.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 84).isActive = true
-        // Stash the path on the control so the click handler knows which file to open.
-        button.identifier = NSUserInterfaceItemIdentifier(url.path)
-        button.toolTip = "Open \(url.lastPathComponent)"
-        return button
-    }
-
-    @objc private func openPhoto(_ sender: NSButton) {
-        guard let path = sender.identifier?.rawValue else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-    }
-
-    private func buildAboutPane() -> NSView {
-        let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
-
-        let versionValue = NSTextField(labelWithString: version)
-        versionValue.font = .systemFont(ofSize: 13)
-        versionValue.textColor = .secondaryLabelColor
-
-        let resetButton = NSButton(title: "Reset…", target: self, action: #selector(reset))
-        resetButton.bezelStyle = .rounded
-
-        let deleteButton = NSButton(title: "Delete SoftLock…", target: self, action: #selector(deleteApp))
-        deleteButton.bezelStyle = .rounded
-        deleteButton.contentTintColor = .systemRed
-
-        let pane = verticalGroups([
-            makeGroup([
-                makeRow("Version", control: versionValue),
-                makeRow("Reset all settings", control: resetButton)
-            ]),
-            changelogSection(),
-            makeGroup([
-                makeRow("Delete passcode & permissions", control: deleteButton)
-            ])
-        ])
-        pane.addArrangedSubview(footnote("Delete SoftLock clears your passcode, settings, and the macOS permission grants (Accessibility, Screen Recording, Camera), then quits — so a reinstall starts clean without stale permissions to remove by hand."))
-        pane.addArrangedSubview(footnote("softlock by oguzberkacar — a menu bar lock that keeps local agents running while blocking casual access to your Mac."))
-        return pane
-    }
-
-    // MARK: - Grouped-row helpers
-
-    private func verticalGroups(_ views: [NSView]) -> NSStackView {
-        let stack = NSStackView(views: views)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 18
-        return stack
-    }
-
-    // MARK: macOS 26 (Tahoe) settings styling
-
-    /// Corner radius for grouped "inset" cards, matching macOS 26 System Settings.
-    static let cardCornerRadius: CGFloat = 12
-
-    /// Applies the macOS 26 grouped-card look: continuous rounded corners, a soft fill, and a
-    /// faint hairline border that gives the card definition over the translucent background.
-    private func applyCardStyle(to view: NSView) {
-        view.wantsLayer = true
-        view.layer?.cornerRadius = Self.cardCornerRadius
-        view.layer?.cornerCurve = .continuous
-        view.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        view.layer?.borderWidth = 1
-        view.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
-    }
-
-    /// A thin inset hairline between rows, lighter than NSBox's separator to match Tahoe.
-    private func makeRowSeparator(in stack: NSStackView) -> NSView {
-        let line = NSView()
-        line.wantsLayer = true
-        line.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
-        line.translatesAutoresizingMaskIntoConstraints = false
-        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        return line
-    }
-
-    private func makeGroup(_ rows: [NSView]) -> NSView {
-        let container = NSView()
-        applyCardStyle(to: container)
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.widthAnchor.constraint(equalToConstant: 520).isActive = true
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 0
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
-
-        for (i, row) in rows.enumerated() {
-            if i > 0 {
-                let sep = makeRowSeparator(in: stack)
-                stack.addArrangedSubview(sep)
-                sep.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 16).isActive = true
-                sep.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
-            }
-            stack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-        return container
-    }
-
-    private func makeRow(_ label: String, control: NSView?, height: CGFloat = 42) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.heightAnchor.constraint(equalToConstant: height).isActive = true
-
-        let lbl = NSTextField(labelWithString: label)
-        lbl.font = .systemFont(ofSize: 13)
-        lbl.textColor = .labelColor
-        lbl.translatesAutoresizingMaskIntoConstraints = false
-        lbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        lbl.lineBreakMode = .byTruncatingTail
-        row.addSubview(lbl)
-        NSLayoutConstraint.activate([
-            lbl.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
-            lbl.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-        ])
-
-        if let control {
-            control.translatesAutoresizingMaskIntoConstraints = false
-            row.addSubview(control)
-            NSLayoutConstraint.activate([
-                control.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
-                control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                control.leadingAnchor.constraint(greaterThanOrEqualTo: lbl.trailingAnchor, constant: 12)
-            ])
-        }
-        return row
-    }
-
-    /// "What's New" block for the About pane: a heading plus a scrollable card that renders
-    /// `Changelog.entries`, so release notes live in one place and show up in Settings.
-    private func changelogSection() -> NSView {
-        let heading = NSTextField(labelWithString: "What's New")
-        heading.font = .systemFont(ofSize: 13, weight: .semibold)
-
-        let entriesStack = NSStackView()
-        entriesStack.orientation = .vertical
-        entriesStack.alignment = .leading
-        entriesStack.spacing = 6
-        entriesStack.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
-        entriesStack.translatesAutoresizingMaskIntoConstraints = false
-
-        for (index, entry) in Changelog.entries.enumerated() {
-            if index > 0 {
-                entriesStack.setCustomSpacing(16, after: entriesStack.arrangedSubviews.last!)
-            }
-            let title = NSTextField(labelWithString: "Version \(entry.version)  ·  \(entry.date)")
-            title.font = .systemFont(ofSize: 13, weight: .semibold)
-            title.textColor = .labelColor
-            entriesStack.addArrangedSubview(title)
-
-            for change in entry.changes {
-                let bullet = NSTextField(wrappingLabelWithString: "•  \(change)")
-                bullet.font = .systemFont(ofSize: 12)
-                bullet.textColor = .secondaryLabelColor
-                bullet.preferredMaxLayoutWidth = 480
-                entriesStack.addArrangedSubview(bullet)
-                bullet.widthAnchor.constraint(equalTo: entriesStack.widthAnchor, constant: -28).isActive = true
-            }
-        }
-
-        // A flipped document keeps the list top-aligned and scrolling from the top; an
-        // ordinary NSView document would pin the content to the bottom.
-        let document = FlippedView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(entriesStack)
-        NSLayoutConstraint.activate([
-            entriesStack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
-            entriesStack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
-            entriesStack.topAnchor.constraint(equalTo: document.topAnchor),
-            entriesStack.bottomAnchor.constraint(equalTo: document.bottomAnchor)
-        ])
-
-        let scroll = NSScrollView()
-        scroll.documentView = document
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        // Mirror the scrollable grid elsewhere in this window: pin the document width to the
-        // clip view so the wrapping labels lay out instead of collapsing to zero width.
-        document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
-
-        let card = NSView()
-        applyCardStyle(to: card)
-        card.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(scroll)
-        NSLayoutConstraint.activate([
-            card.widthAnchor.constraint(equalToConstant: 520),
-            card.heightAnchor.constraint(equalToConstant: 180),
-            scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: card.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: card.bottomAnchor)
-        ])
-
-        let stack = NSStackView(views: [heading, card])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        return stack
-    }
-
-    private func footnote(_ text: String) -> NSTextField {
-        let label = NSTextField(wrappingLabelWithString: text)
-        label.font = .systemFont(ofSize: 11)
-        label.textColor = .tertiaryLabelColor
-        label.preferredMaxLayoutWidth = 520
-        // Pin the width to the cards' so the wrapped height is computed for the real width
-        // (an unconstrained wrapping label can be measured at a different width and get
-        // clipped or leave a gap).
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.widthAnchor.constraint(equalToConstant: 520).isActive = true
-        return label
-    }
-
-    private func passcodeDescription() -> String {
-        switch settings.unlockStyle {
-        case .pin: return "\(settings.pinLength)-digit PIN"
-        case .password: return "Password"
-        }
-    }
-
-    private func configure(_ field: NSTextField, placeholder: String) {
-        field.placeholderString = placeholder
-        field.font = .systemFont(ofSize: 13)
-        field.bezelStyle = .roundedBezel
-        if settings.liquidGlassInputsEnabled {
-            applySettingsGlassStyle(to: field)
-        } else {
-            field.isBezeled = true
-            field.drawsBackground = true
-            field.focusRingType = .default
-            field.backgroundColor = .textBackgroundColor
-            field.layer?.backgroundColor = nil
-            field.layer?.borderWidth = 0
-            field.layer?.shadowOpacity = 0
-        }
-    }
-
-    private func makeBackgroundEffectControl() -> NSView {
-        backgroundKindPopup.removeAllItems()
-        for kind in BackgroundEffectKind.allCases {
-            backgroundKindPopup.addItem(withTitle: kind.title)
-            backgroundKindPopup.lastItem?.representedObject = kind.rawValue
-        }
-        backgroundKindPopup.selectItem(withTitle: settings.backgroundEffectKind.title)
-        backgroundKindPopup.target = self
-        backgroundKindPopup.action = #selector(backgroundEffectChanged)
-
-        blurSlider.doubleValue = settings.blurLevel
-        blurSlider.target = self
-        blurSlider.action = #selector(blurChanged)
-        blurSlider.translatesAutoresizingMaskIntoConstraints = false
-        blurSlider.widthAnchor.constraint(equalToConstant: 154).isActive = true
-        blurValueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
-        blurValueLabel.textColor = .secondaryLabelColor
-        blurValueLabel.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        updateBlurLabel()
-        let blurControl = NSStackView(views: [label("Blur"), blurSlider, blurValueLabel])
-        blurControl.spacing = 8
-        blurControl.alignment = .centerY
-
-        buildBackgroundColorSwatches()
-        let colorControl = NSStackView(views: [label("Color"), backgroundColorStack])
-        colorControl.spacing = 8
-        colorControl.alignment = .centerY
-
-        backgroundMediaButton.target = self
-        backgroundMediaButton.action = #selector(chooseBackgroundMedia)
-        backgroundMediaButton.bezelStyle = .rounded
-        appleWallpapersButton.target = self
-        appleWallpapersButton.action = #selector(chooseAppleWallpaper)
-        appleWallpapersButton.bezelStyle = .rounded
-        appleWallpapersButton.toolTip = "Choose from macOS desktop pictures and wallpaper videos"
-        backgroundMediaClearButton.target = self
-        backgroundMediaClearButton.action = #selector(clearBackgroundMedia)
-        backgroundMediaClearButton.bezelStyle = .rounded
-        backgroundMediaLabel.font = .systemFont(ofSize: 12)
-        backgroundMediaLabel.textColor = .secondaryLabelColor
-        backgroundMediaLabel.lineBreakMode = .byTruncatingMiddle
-        backgroundMediaLabel.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        let mediaControl = NSStackView(views: [
-            label("Media"),
-            backgroundMediaLabel,
-            backgroundMediaButton,
-            appleWallpapersButton,
-            backgroundMediaClearButton
-        ])
-        mediaControl.spacing = 8
-        mediaControl.alignment = .centerY
-
-        let stack = NSStackView(views: [backgroundKindPopup, blurControl, colorControl, mediaControl])
-        stack.orientation = .vertical
-        stack.alignment = .trailing
-        stack.spacing = 8
-        updateBackgroundControls()
-        return stack
-    }
-
-    private func makeInputAppearanceControl() -> NSView {
-        inputAppearancePopup.removeAllItems()
-        for mode in InputAppearanceMode.allCases {
-            inputAppearancePopup.addItem(withTitle: mode.title)
-            inputAppearancePopup.lastItem?.representedObject = mode.rawValue
-        }
-        inputAppearancePopup.selectItem(withTitle: settings.inputAppearanceMode.title)
-        inputAppearancePopup.target = self
-        inputAppearancePopup.action = #selector(inputAppearanceChanged)
-        return inputAppearancePopup
-    }
-
-    private func makeLiquidGlassInputsControl() -> NSView {
-        liquidGlassInputsSwitch.state = settings.liquidGlassInputsEnabled ? .on : .off
-        liquidGlassInputsSwitch.target = self
-        liquidGlassInputsSwitch.action = #selector(liquidGlassInputsChanged)
-        return liquidGlassInputsSwitch
-    }
-
-    private func applySettingsGlassStyle(to field: NSTextField) {
-        field.isBezeled = false
-        field.drawsBackground = false
-        field.focusRingType = .none
-        field.wantsLayer = true
-        field.layer?.cornerRadius = 8
-        field.layer?.cornerCurve = .continuous
-        field.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.46).cgColor
-        field.layer?.borderWidth = 0.8
-        field.layer?.borderColor = NSColor.white.withAlphaComponent(0.28).cgColor
-        field.layer?.shadowColor = NSColor.black.withAlphaComponent(0.22).cgColor
-        field.layer?.shadowOpacity = 1
-        field.layer?.shadowRadius = 12
-        // Layer space is y-up, so a negative height drops the shadow below the field.
-        field.layer?.shadowOffset = CGSize(width: 0, height: -6)
-    }
-
-    private func label(_ value: String) -> NSTextField {
-        let label = NSTextField(labelWithString: value)
-        label.font = .systemFont(ofSize: 12)
-        label.textColor = .secondaryLabelColor
-        label.alignment = .right
-        label.widthAnchor.constraint(equalToConstant: 42).isActive = true
-        return label
-    }
-
-    private func buildBackgroundColorSwatches() {
-        backgroundColorStack.arrangedSubviews.forEach {
-            backgroundColorStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        backgroundColorButtons = []
-        backgroundColorStack.orientation = .horizontal
-        backgroundColorStack.spacing = 6
-        backgroundColorStack.alignment = .centerY
-
-        for (index, swatch) in LockBackgroundSwatch.all.enumerated() {
-            let button = NSButton(title: "", target: self, action: #selector(backgroundColorPicked(_:)))
-            button.tag = index
-            button.isBordered = false
-            button.toolTip = swatch.title
-            button.wantsLayer = true
-            button.layer?.cornerRadius = 8
-            button.layer?.cornerCurve = .continuous
-            button.layer?.backgroundColor = swatch.color.cgColor
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: 22).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 22).isActive = true
-            backgroundColorButtons.append(button)
-            backgroundColorStack.addArrangedSubview(button)
-        }
-        updateBackgroundColorSwatches()
-    }
-
-    private func updateBackgroundControls() {
-        let kind = settings.backgroundEffectKind
-        blurSlider.isEnabled = kind == .blur
-        blurValueLabel.textColor = kind == .blur ? .secondaryLabelColor : .tertiaryLabelColor
-        backgroundColorButtons.forEach { $0.isEnabled = kind == .color }
-        backgroundMediaButton.isEnabled = kind == .media
-        appleWallpapersButton.isEnabled = kind == .media
-        backgroundMediaClearButton.isEnabled = kind == .media && settings.backgroundMediaURL != nil
-        backgroundMediaLabel.stringValue = settings.backgroundMediaDisplayName
-        backgroundMediaLabel.textColor = kind == .media ? .secondaryLabelColor : .tertiaryLabelColor
-        updateBackgroundColorSwatches()
-    }
-
-    private func updateBackgroundColorSwatches() {
-        for (index, button) in backgroundColorButtons.enumerated() {
-            let selected = LockBackgroundSwatch.all[index].id == settings.backgroundColorID
-            button.layer?.borderWidth = selected ? 2 : 1
-            button.layer?.borderColor = selected
-                ? NSColor.controlAccentColor.cgColor
-                : NSColor.separatorColor.withAlphaComponent(0.55).cgColor
-        }
-    }
-
-    private func makeLaunchAtLoginControl() -> NSView {
-        launchAtLoginSwitch.target = self
-        launchAtLoginSwitch.action = #selector(launchAtLoginChanged)
-
-        launchAtLoginStatusLabel.font = .systemFont(ofSize: 12)
-        launchAtLoginStatusLabel.alignment = .right
-        launchAtLoginStatusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 155).isActive = true
-
-        launchAtLoginSettingsButton.target = self
-        launchAtLoginSettingsButton.action = #selector(openLoginItemsSettings)
-        launchAtLoginSettingsButton.bezelStyle = .rounded
-
-        let control = NSStackView(views: [launchAtLoginSwitch, launchAtLoginStatusLabel, launchAtLoginSettingsButton])
-        control.spacing = 8
-        updateLaunchAtLoginControls()
-        return control
-    }
-
-    // MARK: - Live apply
-
-    @objc private func lockTapped() {
-        window.close()
-        onLock()
-    }
-
-    @objc private func changePasscodeTapped() {
-        window.close()
-        onChangePasscode()
-    }
-
-    func controlTextDidEndEditing(_ obj: Notification) {
-        applyTitle()
-    }
-
-    private func applyTitle() {
-        settings.lockTitle = titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    @objc private func blurChanged() {
-        updateBlurLabel()
-        settings.blurLevel = blurSlider.doubleValue
-    }
-
-    @objc private func backgroundEffectChanged() {
-        let rawValue = backgroundKindPopup.selectedItem?.representedObject as? String
-        settings.backgroundEffectKind = BackgroundEffectKind(rawValue: rawValue ?? "") ?? .blur
-        updateBackgroundControls()
-    }
-
-    @objc private func backgroundColorPicked(_ sender: NSButton) {
-        guard LockBackgroundSwatch.all.indices.contains(sender.tag) else { return }
-        settings.backgroundColorID = LockBackgroundSwatch.all[sender.tag].id
-        settings.backgroundEffectKind = .color
-        backgroundKindPopup.selectItem(withTitle: BackgroundEffectKind.color.title)
-        updateBackgroundControls()
-    }
-
-    @objc private func chooseBackgroundMedia() {
-        openBackgroundMediaPanel(startingAt: nil, showsHiddenFiles: false)
-    }
-
-    @objc private func chooseAppleWallpaper() {
-        let assets = SystemWallpaperLibrary.assets()
-        guard !assets.isEmpty else {
-            openBackgroundMediaPanel(
-                startingAt: URL(fileURLWithPath: "/System/Library/Desktop Pictures", isDirectory: true),
-                showsHiddenFiles: true
-            )
-            return
-        }
-
-        let picker = WallpaperPickerWindowController(assets: assets) { [weak self] asset in
-            self?.importBackgroundMedia(from: asset.sourceURL)
-        }
-        wallpaperPicker = picker
-        window.beginSheet(picker.window) { [weak self] _ in
-            self?.wallpaperPicker = nil
-        }
-    }
-
-    private func openBackgroundMediaPanel(startingAt directoryURL: URL?, showsHiddenFiles: Bool) {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        var contentTypes: [UTType] = [.image, .movie]
-        if let madeDesktopType = UTType(filenameExtension: "madesktop") {
-            contentTypes.append(madeDesktopType)
-        }
-        panel.allowedContentTypes = contentTypes
-        panel.directoryURL = directoryURL
-        panel.showsHiddenFiles = showsHiddenFiles
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.importBackgroundMedia(from: url)
-        }
-    }
-
-    private func importBackgroundMedia(from url: URL) {
-        Task { @MainActor in
-            do {
-                try settings.storeBackgroundMedia(from: url)
-                settings.backgroundEffectKind = .media
-                backgroundKindPopup.selectItem(withTitle: BackgroundEffectKind.media.title)
-                updateBackgroundControls()
-            } catch {
-                backgroundMediaLabel.stringValue = "Couldn't load"
-                AppLog.write("background media import failed: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    @objc private func clearBackgroundMedia() {
-        settings.clearBackgroundMedia()
-        updateBackgroundControls()
-    }
-
-    @objc private func inputAppearanceChanged() {
-        let rawValue = inputAppearancePopup.selectedItem?.representedObject as? String
-        settings.inputAppearanceMode = InputAppearanceMode(rawValue: rawValue ?? "") ?? .auto
-    }
-
-    @objc private func liquidGlassInputsChanged() {
-        settings.liquidGlassInputsEnabled = liquidGlassInputsSwitch.state == .on
-        selectPane(selectedIndex)
-    }
-
-    @objc private func touchIDChanged() {
-        settings.useTouchID = touchIDSwitch.state == .on
-    }
-
-    @objc private func captureChanged() {
-        settings.capturePhotoOnFailure = captureSwitch.state == .on
-        updatePermissionsLabel()
-    }
-
-    @objc private func maxPhotosChanged() {
-        updateMaxPhotosLabel()
-        settings.maxFailedAttemptPhotos = maxPhotosStepper.integerValue
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        applyTitle()
-    }
-
-    private func updateBlurLabel() {
-        blurValueLabel.stringValue = "\(Int((blurSlider.doubleValue * 100).rounded()))%"
-    }
-
-    private func updateMaxPhotosLabel() {
-        maxPhotosLabel.stringValue = "\(maxPhotosStepper.integerValue) photos"
-    }
-
-    private func updateLaunchAtLoginControls() {
-        let status = settings.launchAtLoginStatus
-        launchAtLoginSwitch.isEnabled = status != .notFound
-        launchAtLoginSettingsButton.isHidden = status != .requiresApproval && status != .notFound
-
-        switch status {
-        case .enabled:
-            launchAtLoginSwitch.state = .on
-            launchAtLoginStatusLabel.stringValue = "Enabled"
-            launchAtLoginStatusLabel.textColor = .systemGreen
-            launchAtLoginSettingsButton.title = "Open Settings..."
-            launchAtLoginSettingsButton.action = #selector(openLoginItemsSettings)
-        case .notRegistered:
-            launchAtLoginSwitch.state = .off
-            launchAtLoginStatusLabel.stringValue = launchAtLoginError ?? "Off"
-            launchAtLoginStatusLabel.textColor = launchAtLoginError == nil ? .secondaryLabelColor : .systemRed
-            launchAtLoginSettingsButton.title = "Open Settings..."
-            launchAtLoginSettingsButton.action = #selector(openLoginItemsSettings)
-        case .requiresApproval:
-            launchAtLoginSwitch.state = .on
-            launchAtLoginStatusLabel.stringValue = "Needs approval"
-            launchAtLoginStatusLabel.textColor = .systemOrange
-            launchAtLoginSettingsButton.title = "Open Settings..."
-            launchAtLoginSettingsButton.action = #selector(openLoginItemsSettings)
-        case .notFound:
-            launchAtLoginSwitch.state = .off
-            launchAtLoginStatusLabel.stringValue = launchAtLoginError ?? settings.launchAtLoginUnavailableReason
-            launchAtLoginStatusLabel.textColor = .systemRed
-            launchAtLoginSettingsButton.title = "Reveal App"
-            launchAtLoginSettingsButton.action = #selector(revealCurrentApp)
-        @unknown default:
-            launchAtLoginSwitch.state = .off
-            launchAtLoginStatusLabel.stringValue = "Unknown"
-            launchAtLoginStatusLabel.textColor = .systemRed
-            launchAtLoginSettingsButton.title = "Open Settings..."
-            launchAtLoginSettingsButton.action = #selector(openLoginItemsSettings)
-        }
-    }
-
-    @objc private func launchAtLoginChanged() {
-        launchAtLoginError = nil
-        do {
-            try settings.setLaunchAtLoginEnabled(launchAtLoginSwitch.state == .on)
-        } catch {
-            launchAtLoginError = "Couldn't update"
-            AppLog.write("launch at login update failed: \(error.localizedDescription)")
-        }
-        updateLaunchAtLoginControls()
-    }
-
-    @objc private func openLoginItemsSettings() {
-        SMAppService.openSystemSettingsLoginItems()
-        updateLaunchAtLoginControls()
-    }
-
-    @objc private func revealCurrentApp() {
-        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
-    }
-
-    @objc private func checkPermissions() {
-        let cameraRequired = captureSwitch.state == .on
-        if cameraRequired, AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in
-                DispatchQueue.main.async {
-                    self?.updatePermissionsLabel()
-                }
-            }
-            return
-        }
-
-        if !AXIsProcessTrusted() {
-            let promptKey = "AXTrustedCheckOptionPrompt" as NSString
-            AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
-        }
-
-        if !CGPreflightScreenCaptureAccess() {
-            _ = CGRequestScreenCaptureAccess()
-        }
-
-        updatePermissionsLabel()
-    }
-
-    private func updatePermissionsLabel() {
-        let statuses = currentPermissionStatuses()
-
-        permissionsStack.arrangedSubviews.forEach {
-            permissionsStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-
-        for status in statuses {
-            permissionsStack.addArrangedSubview(makePermissionRow(status))
-        }
-    }
-
-    /// One line per permission, stacked vertically so they never get truncated the way
-    /// the old single side-by-side line did. Green check when ready, red cross plus a Grant
-    /// button when a needed permission is missing. A permission that isn't needed in the
-    /// current configuration shows a muted "Not needed" instead of a red warning.
-    private func makePermissionRow(_ status: PermissionStatus) -> NSView {
-        let symbolName: String
-        let tint: NSColor
-        if status.ok {
-            symbolName = status.required ? "checkmark.circle.fill" : "minus.circle.fill"
-            tint = status.required ? .systemGreen : .tertiaryLabelColor
-        } else {
-            symbolName = "xmark.circle.fill"
-            tint = .systemRed
-        }
-
-        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
-        let icon = NSImageView(image: NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
-            .withSymbolConfiguration(config) ?? NSImage())
-        icon.contentTintColor = tint
-
-        let label = NSTextField(labelWithString: status.ok && !status.required ? "\(status.name) (not needed)" : status.name)
-        label.font = .systemFont(ofSize: 12, weight: .medium)
-        label.textColor = tint
-
-        let row = NSStackView(views: [icon, label])
-        row.orientation = .horizontal
-        row.spacing = 5
-        row.alignment = .centerY
-
-        if !status.ok {
-            let grant = NSButton(title: "Grant", target: self, action: #selector(grantPermission(_:)))
-            grant.bezelStyle = .inline
-            grant.controlSize = .small
-            grant.font = .systemFont(ofSize: 11, weight: .semibold)
-            grant.tag = permissionTag(status.kind)
-            row.addArrangedSubview(grant)
-        }
-
-        row.toolTip = status.ok ? "\(status.name): \(status.required ? "Ready" : "Not needed")" : "\(status.name): \(status.detail)"
-        return row
-    }
-
-    private func permissionTag(_ kind: PermissionKind) -> Int {
-        switch kind {
-        case .accessibility: return 0
-        case .screenRecording: return 1
-        case .camera: return 2
-        }
-    }
-
-    @objc private func grantPermission(_ sender: NSButton) {
-        let kind: PermissionKind = sender.tag == 0 ? .accessibility : (sender.tag == 1 ? .screenRecording : .camera)
-        switch kind {
-        case .accessibility:
-            let promptKey = "AXTrustedCheckOptionPrompt" as NSString
-            AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
-            openPrivacyPane(kind)
-        case .screenRecording:
-            _ = CGRequestScreenCaptureAccess()
-            openPrivacyPane(kind)
-        case .camera:
-            if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
-                AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in
-                    DispatchQueue.main.async { self?.updatePermissionsLabel() }
-                }
-            } else {
-                openPrivacyPane(kind)
-            }
-        }
-        updatePermissionsLabel()
-    }
-
-    private func openPrivacyPane(_ kind: PermissionKind) {
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(kind.privacyAnchor)") else { return }
-        NSWorkspace.shared.open(url)
-    }
-
-    private func currentPermissionStatuses() -> [PermissionStatus] {
-        // Screen Recording is only used to sample the desktop for Auto input appearance over a
-        // see-through background — mirror exactly that condition (see sampleScreenBrightness).
-        let screenRecordingRequired = settings.inputAppearanceMode == .auto
-            && (settings.backgroundEffectKind == .transparent || settings.backgroundEffectKind == .blur)
-
-        let cameraRequired = captureSwitch.state == .on
-        let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
-
-        return [
-            PermissionStatus(
-                name: "Accessibility",
-                kind: .accessibility,
-                ok: AXIsProcessTrusted(),
-                required: true,
-                detail: "needed for keyboard/mouse lock protection"
-            ),
-            PermissionStatus(
-                name: "Screen Recording",
-                kind: .screenRecording,
-                ok: !screenRecordingRequired || CGPreflightScreenCaptureAccess(),
-                required: screenRecordingRequired,
-                detail: "needed for Auto input appearance over transparent/blur backgrounds"
-            ),
-            PermissionStatus(
-                name: "Camera",
-                kind: .camera,
-                ok: !cameraRequired || cameraStatus == .authorized,
-                required: cameraRequired,
-                detail: cameraRequired ? cameraStatus.permissionDetail : "optional unless failed-attempt photos are enabled"
-            )
-        ]
-    }
-
-    @objc private func reset() {
-        settings.lockTitle = AppSettings.defaultLockTitle
-        settings.backgroundEffectKind = .blur
-        settings.blurLevel = AppSettings.defaultBlurLevel
-        settings.backgroundColorID = LockBackgroundSwatch.defaultID
-        settings.clearBackgroundMedia()
-        settings.inputAppearanceMode = .auto
-        settings.liquidGlassInputsEnabled = false
-        settings.lockShortcuts = [AppSettings.defaultShortcut]
-        settings.useTouchID = BiometricAuth.isAvailable
-        settings.capturePhotoOnFailure = false
-        settings.maxFailedAttemptPhotos = AppSettings.defaultMaxFailedAttemptPhotos
-        FaceUnlockSettings.shared.isEnabled = false
-        selectPane(selectedIndex)
-    }
-
-    @objc private func deleteApp() {
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Delete SoftLock?"
-        alert.informativeText = "This erases your passcode and settings and revokes SoftLock's macOS permissions (Accessibility, Screen Recording, Camera). SoftLock will quit. You can re-grant permissions next time you launch it.\n\nThis can't be undone."
-        alert.addButton(withTitle: "Delete & Quit")
-        alert.addButton(withTitle: "Cancel")
-
-        if let cancel = alert.buttons.last {
-            alert.window.defaultButtonCell = cancel.cell as? NSButtonCell
-        }
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-
-        window.close()
-        onDeleteApp()
-    }
-
-    @objc private func openFailedAttempts() {
-        do {
-            let directoryURL = try FailedAttemptStore.directory()
-            NSWorkspace.shared.open(directoryURL)
-        } catch {
-            AppLog.write("failed attempts folder open failed: \(error.localizedDescription)")
-        }
-    }
-}
 @MainActor
 private final class SetupWindowController: NSObject {
     private let store: PasswordStore
@@ -2084,32 +749,49 @@ private final class LockerController: NSObject {
     private let store: PasswordStore
     private let settings: AppSettings
     private let onUnlock: (Bool) -> Void
-    private var windows: [LockWindow] = []
+    /// One panel per connected display. Every panel carries a complete credential stack, but
+    /// only `activePanel` shows it; the others show the clock alone. Clicking a display makes
+    /// its panel active (see `activatePanel`), so the passcode follows the user.
+    private var panels: [LockScreenPanel] = []
+    private var activePanel: LockScreenPanel?
+    private var windows: [LockWindow] { panels.map(\.window) }
+    /// True from `lock` until `unlock`. The windows array is not a reliable stand-in: it keeps
+    /// the hidden windows of the previous lock around until the next one rebuilds them.
+    private var isLocked = false
     private var eventTap: CFMachPort?
     private var eventSource: CFRunLoopSource?
-    private var passwordField: NSSecureTextField?
-    private var statusLabel: LockStatusView?
-    private var faceSelfView: LockFaceSelfView?
+    private var passwordField: NSSecureTextField? { activePanel?.passwordField }
+    private var statusLabel: LockStatusView? { activePanel?.status }
+    private var faceSelfView: LockFaceSelfView? { activePanel?.faceSelfView }
     private var faceSession: AVCaptureSession?
     private var faceViewState: FaceUnlockViewState = .scanning
-    private var touchIDButton: NSButton?
-    private var faceScanButton: NSButton?
-    private var faceScanKeyMonitor: Any?
-    private var pinInputView: PINInputView?
-    private var pinRecoveryField: NSSecureTextField?
-    private var pinRecoveryContainer: NSView?
+    private var faceScanButton: NSButton? { activePanel?.faceScanButton }
+    private var unlockShortcutKeyMonitor: Any?
+    private var pinInputView: PINInputView? { activePanel?.pinInputView }
+    private var pinRecoveryField: NSSecureTextField? { activePanel?.pinRecoveryField }
+    private var pinRecoveryContainer: NSView? { activePanel?.pinRecoveryContainer }
     private var biometricInProgress = false
+    private var biometricPromptTimer: Timer?
+    /// The Touch ID key went down on an empty field; its release opens the prompt.
+    private var touchIDKeyArmed = false
+    /// The live Touch ID sheet's context, kept so `unlock` can dismiss the sheet.
+    private var biometricContext: LAContext?
+    /// Whether the credential input currently accepts typing (false during a brute-force
+    /// lockout or the hot-key release gate). Applied to every panel, and to a panel again
+    /// when it becomes active, so a display clicked mid-lockout can't offer an open prompt.
+    private var inputEnabled = true
+    private var sampledBrightness: [UInt32: Double] = [:]
+    /// The last status shown, replayed onto a display when the input moves there.
+    private var lastStatus: (text: String, tone: FaceUnlockStatusKind) = ("", .info)
     private var failedAttempts = 0
     private var lockoutTimer: Timer?
     private var lockoutRemaining = 0
     private let credentialErrorText = "Incorrect — try again."
-    private var clockLabels: [(time: NSTextField, date: NSTextField)] = []
     private var clockTimer: Timer?
     private var hotKeyInputGate: HotKeyInputGate?
     private var hotKeyInputGateTimer: Timer?
     private var hotKeyInputGatePollTimer: Timer?
     private var observesDisplayChanges = false
-    private var primaryDisplayID: UInt32?
 
     private struct HotKeyInputGate {
         let keyCode: Int
@@ -2132,23 +814,28 @@ private final class LockerController: NSObject {
     func lock(trigger: LockTrigger) {
         requestAccessibilityIfNeeded()
         startObservingDisplayChanges()
+        isLocked = true
+        sampledBrightness = [:]
         // Before rebuilding: a previous face unlock leaves the green ring and tick behind, and a
         // stopped capture session in `faceSession`. A fresh lock screen must not adopt either.
         faceSession = nil
         faceViewState = .scanning
+        lastStatus = ("", .info)
+        inputEnabled = true
         // Rebuild every time so the current blur/title/passcode settings always apply.
-        rebuildWindows()
+        buildFreshPanels()
         failedAttempts = 0
         lockoutTimer?.invalidate()
         lockoutTimer = nil
         resetCredentialInput()
-        statusLabel?.show("")
+        showStatus("", tone: .info)
         configureInitialInputState(for: trigger)
         installEventTap()
         startClock()
         activateLock()
-        installFaceScanKeyMonitor()
+        installUnlockShortcutKeyMonitor()
         startFaceUnlockIfNeeded()
+        scheduleAutomaticTouchIDPrompt()
     }
 
     /// Optional face unlock (off by default). Adds a way in next to the passcode and Touch ID; never
@@ -2156,14 +843,41 @@ private final class LockerController: NSObject {
     private func startFaceUnlockIfNeeded() {
         faceSession = nil
         faceViewState = .scanning
-        guard FaceUnlockSettings.shared.isReadyForLockScreen else { return }
+        guard FaceUnlockSettings.shared.isReadyForLockScreen else {
+            if !(touchIDUsable && settings.touchIDPromptOnLock) {
+                showIdleHint()
+            }
+            return
+        }
         guard FaceUnlockSettings.shared.autoScanOnLock else {
             // Manual mode: nothing looks at the camera until the button or Space asks it to.
             updateFaceScanButton()
-            showStatus(Self.faceScanHint, tone: .info)
+            showIdleHint()
             return
         }
         beginFaceScan()
+    }
+
+    /// The hint shown while nothing is happening: how to start the biometric way in. Face
+    /// unlock owns Space when it is set up for manual scanning; otherwise Touch ID does. Says
+    /// nothing when there is nothing to say — the passcode field explains itself.
+    private func showIdleHint() {
+        let faceManual = FaceUnlockSettings.shared.isReadyForLockScreen
+            && !FaceUnlockSettings.shared.autoScanOnLock
+            && !FaceUnlockController.shared.isScanning
+        let touchKey = settings.touchIDTriggerKey.title
+        switch (faceManual, touchIDUsable) {
+        case (true, true): showStatus("Space scans your face. \(touchKey) opens Touch ID.", tone: .info)
+        case (true, false): showStatus(Self.faceScanHint, tone: .info)
+        case (false, true):
+            guard !FaceUnlockSettings.shared.isReadyForLockScreen else { return }
+            showStatus("Press \(touchKey) or tap Use Touch ID to unlock with your fingerprint.", tone: .info)
+        case (false, false): break
+        }
+    }
+
+    private var touchIDUsable: Bool {
+        settings.useTouchID && BiometricAuth.isAvailable
     }
 
     /// Starts one face scan cycle. Manual trigger (camera button / Space) and the automatic
@@ -2171,7 +885,7 @@ private final class LockerController: NSObject {
     private func beginFaceScan() {
         guard FaceUnlockSettings.shared.isReadyForLockScreen else { return }
         // Face unlock respects the brute-force lockout exactly like Touch ID does.
-        guard lockoutTimer == nil, !windows.isEmpty else { return }
+        guard lockoutTimer == nil, isLocked else { return }
         guard !FaceUnlockController.shared.isScanning else { return }
         let missPhoto: ((FaceCameraFrame) -> Void)? = settings.capturePhotoOnFailure
             ? { [weak self] frame in self?.saveFaceMissPhoto(frame) }
@@ -2181,7 +895,7 @@ private final class LockerController: NSObject {
             onMissFrame: missPhoto,
             onUnlock: { [weak self] in
                 // Respect the brute-force lockout exactly like Touch ID does.
-                guard let self, self.lockoutTimer == nil, !self.windows.isEmpty else { return false }
+                guard let self, self.lockoutTimer == nil, self.isLocked else { return false }
                 self.unlock(recoveryUsed: false)
                 return true
             }
@@ -2224,41 +938,83 @@ private final class LockerController: NSObject {
         AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
     }
 
+    /// A fresh lock: the previous lock's panels are dropped without carrying anything over
+    /// (their fields may still hold the passcode that unlocked last time).
+    private func buildFreshPanels() {
+        let old = panels
+        panels = []
+        activePanel = nil
+        buildPanels(preferringDisplay: nil, carryingInputFrom: nil)
+        old.forEach { $0.window.orderOut(nil) }
+    }
+
+    /// Mid-lock rebuild (display topology or resolution class changed): the typed input and the
+    /// active display survive when that display still exists.
     private func rebuildWindows() {
-        let oldWindows = windows
-        windows = []
-        clockLabels = []
-        passwordField = nil
-        pinInputView = nil
-        pinRecoveryField = nil
-        pinRecoveryContainer = nil
-        touchIDButton = nil
-        faceScanButton = nil
-        statusLabel = nil
-        faceSelfView = nil
-        buildWindows()
-        oldWindows.forEach { $0.orderOut(nil) }
+        let old = panels
+        let oldActive = activePanel
+        panels = []
+        activePanel = nil
+        buildPanels(preferringDisplay: oldActive?.displayID, carryingInputFrom: oldActive)
+        // New windows are up before the old ones go, so the desktop never shows in between.
+        old.forEach { $0.window.orderOut(nil) }
     }
 
-    private func buildWindows() {
-        let screens = NSScreen.screens
-        // `NSScreen.main` is the screen with keyboard focus, and it is nil when no window is
-        // key. Falling back keeps exactly one window hosting the credential input — with a
-        // nil main screen every window would be built as secondary, putting up a lock screen
-        // with no way to type a passcode at all.
-        let primary = NSScreen.main ?? screens.first
-        primaryDisplayID = primary?.directDisplayID
-        windows = screens.map { makeLockWindow(on: $0, primary: $0 == primary) }
+    private func buildPanels(preferringDisplay previousDisplayID: UInt32?, carryingInputFrom previous: LockScreenPanel?) {
+        panels = NSScreen.screens.map { makePanel(on: $0) }
+        let initial = panels.first { previousDisplayID != nil && $0.displayID == previousDisplayID }
+            ?? preferredPanel(among: panels)
+        guard let initial else {
+            AppLog.write("lock: no displays to host the passcode input")
+            return
+        }
+        activatePanel(initial, carryingInputFrom: previous)
     }
 
-    /// Displays added *after* the lock is up are always secondary: a change of primary
-    /// display is detected earlier in `reconcileDisplayWindows` and forces a full rebuild.
-    private func makeLockWindow(on screen: NSScreen, primary: Bool = false) -> LockWindow {
-        let window = LockWindow(screen: screen)
-        window.builtCompact = Self.isCompact(screen)
-        window.contentView = makeContentView(on: screen, primary: primary)
-        window.makeKeyAndOrderFront(nil)
-        return window
+    /// Which display hosts the passcode when the lock goes up, or when the active display is
+    /// unplugged. A display chosen in Settings wins. Otherwise, when face unlock will look
+    /// through the built-in camera, the built-in display: that is where the camera looks from,
+    /// so the self-view sits in front of the user's face. Otherwise the display under the
+    /// pointer, which is the one the user was working on. Clicking any display moves it later.
+    private func preferredPanel(among candidates: [LockScreenPanel]) -> LockScreenPanel? {
+        let faceUsesBuiltInCamera = FaceUnlockSettings.shared.isReadyForLockScreen
+            && FaceCameraFeed.isBuiltIn(FaceCameraFeed.resolveDevice(preferredUniqueID: FaceUnlockSettings.shared.cameraUniqueID))
+        let chosen = UnlockDisplayPolicy.choose(
+            among: candidates.map { UnlockDisplayCandidate(id: ObjectIdentifier($0), name: $0.displayName, isBuiltIn: $0.isBuiltInDisplay) },
+            preferredName: settings.unlockDisplayName,
+            faceUnlockUsesBuiltInCamera: faceUsesBuiltInCamera,
+            pointerDisplay: NSScreen.screenUnderMouse?.directDisplayID.flatMap { id in candidates.first { $0.displayID == id } }.map(ObjectIdentifier.init),
+            mainDisplay: NSScreen.main?.directDisplayID.flatMap { id in candidates.first { $0.displayID == id } }.map(ObjectIdentifier.init)
+        )
+        return candidates.first { ObjectIdentifier($0) == chosen }
+    }
+
+    /// Moves the credential input to `panel`. The text typed so far, the recovery-entry mode,
+    /// the enabled state, the status pill and a running face scan's self-view all come along, so
+    /// clicking another display mid-entry is never a reset.
+    private func activatePanel(_ panel: LockScreenPanel, carryingInputFrom previous: LockScreenPanel? = nil) {
+        guard panel !== activePanel else { return }
+        let source = previous ?? activePanel
+        if let source {
+            panel.adoptInput(from: source)
+            source.isActive = false
+            source.faceSelfView?.detach()
+            source.clearInput()
+        }
+        activePanel = panel
+        panel.setInputEnabled(inputEnabled)
+        panel.isActive = true
+        if let faceSession {
+            panel.faceSelfView?.attachPreview(session: faceSession)
+            panel.faceSelfView?.setState(faceViewState)
+        }
+        updateFaceScanButton()
+        panel.status.show(lastStatus.text, tone: lastStatus.tone)
+        // While the system Touch ID sheet is up, taking key status or focus would cover it.
+        if !biometricInProgress {
+            panel.window.makeKeyAndOrderFront(nil)
+            focusActiveInput()
+        }
     }
 
     fileprivate static func isCompact(_ screen: NSScreen) -> Bool {
@@ -2304,14 +1060,14 @@ private final class LockerController: NSObject {
         let screenPairs = screens.compactMap { screen in
             screen.directDisplayID.map { ($0, screen) }
         }
-        let windowPairs = windows.compactMap { window in
-            window.displayID.map { ($0, window) }
+        let panelPairs = panels.compactMap { panel in
+            panel.displayID.map { ($0, panel) }
         }
 
         guard screenPairs.count == screens.count,
-              windowPairs.count == windows.count,
+              panelPairs.count == panels.count,
               Set(screenPairs.map(\.0)).count == screenPairs.count,
-              Set(windowPairs.map(\.0)).count == windowPairs.count
+              Set(panelPairs.map(\.0)).count == panelPairs.count
         else {
             AppLog.write("display reconciliation fallback: invalid display identifiers")
             rebuildWindows()
@@ -2321,36 +1077,29 @@ private final class LockerController: NSObject {
         }
 
         let screensByID = Dictionary(uniqueKeysWithValues: screenPairs)
-        let windowsByID = Dictionary(uniqueKeysWithValues: windowPairs)
-        let currentPrimaryDisplayID = NSScreen.main?.directDisplayID
-
-        guard currentPrimaryDisplayID == primaryDisplayID else {
-            AppLog.write("primary display changed; rebuilding lock windows")
-            rebuildWindows()
-            restoreInputStateAfterRebuild()
-            activateLock()
-            return
-        }
+        let panelsByID = Dictionary(uniqueKeysWithValues: panelPairs)
 
         let delta = DisplayTopology.delta(
-            existing: Set(windowsByID.keys),
+            existing: Set(panelsByID.keys),
             current: Set(screensByID.keys)
         )
 
+        // Every panel carries its own input, so a display plugged in mid-lock is covered and
+        // usable straight away; it just starts inactive (clock only) until it is clicked.
         for id in delta.added {
             guard let screen = screensByID[id] else { continue }
-            windows.append(makeLockWindow(on: screen))
+            panels.append(makePanel(on: screen))
             AppLog.write("covered newly connected display: \(id)")
         }
 
         var needsRelayout = false
         for id in delta.retained {
-            guard let screen = screensByID[id], let window = windowsByID[id] else { continue }
-            window.setFrame(screen.frame, display: true)
+            guard let screen = screensByID[id], let panel = panelsByID[id] else { continue }
+            panel.window.setFrame(screen.frame, display: true)
             // The layout metrics (font sizes, keypad size, offsets) are chosen from the display
             // height at build time, so a resolution change that crosses the threshold needs a
             // fresh layout rather than just a resized window.
-            if window.builtCompact != Self.isCompact(screen) {
+            if panel.window.builtCompact != Self.isCompact(screen) {
                 needsRelayout = true
             }
         }
@@ -2364,10 +1113,20 @@ private final class LockerController: NSObject {
         }
 
         for id in delta.removed {
-            windowsByID[id]?.orderOut(nil)
+            panelsByID[id]?.window.orderOut(nil)
         }
-        windows.removeAll { window in
-            window.displayID.map(delta.removed.contains) ?? true
+        panels.removeAll { panel in
+            panel.displayID.map(delta.removed.contains) ?? true
+        }
+
+        // The display hosting the passcode was unplugged: move the input (and whatever was
+        // typed into it) to the next best display instead of leaving no way to unlock.
+        if let active = activePanel, !panels.contains(where: { $0 === active }) {
+            activePanel = nil
+            if let next = preferredPanel(among: panels) {
+                AppLog.write("active display removed; moving the passcode input")
+                activatePanel(next, carryingInputFrom: active)
+            }
         }
 
         maintainLockPresentation(refocusInput: true)
@@ -2387,7 +1146,12 @@ private final class LockerController: NSObject {
         setInputEnabled(hotKeyInputGate == nil)
     }
 
-    private func makeContentView(on screen: NSScreen, primary: Bool) -> NSView {
+    /// Builds one display's lock window with everything on it. The credential stack starts
+    /// hidden; `activatePanel` reveals it on the display that should host the input.
+    private func makePanel(on screen: NSScreen) -> LockScreenPanel {
+        let window = LockWindow(screen: screen)
+        window.builtCompact = Self.isCompact(screen)
+
         let root = NSView()
         root.wantsLayer = true
         root.layer?.backgroundColor = NSColor.clear.cgColor
@@ -2397,8 +1161,17 @@ private final class LockerController: NSObject {
         let compact = Self.isCompact(screen)
 
         installLockBackground(in: root)
-        let screenBrightness = primary ? sampleScreenBrightness(on: screen) : nil
-        let appearance = settings.resolvedInputAppearance(screenBrightness: screenBrightness)
+        // Each display samples its own desktop: the input can end up on any of them.
+        // Sampled once per display per lock: a rebuild mid-lock (display change) would otherwise
+        // photograph the lock overlay itself and mistake it for the desktop.
+        var brightness: Double?
+        if let id = screen.directDisplayID, let cached = sampledBrightness[id] {
+            brightness = cached
+        } else {
+            brightness = sampleScreenBrightness(on: screen)
+            if let id = screen.directDisplayID, let brightness { sampledBrightness[id] = brightness }
+        }
+        let appearance = settings.resolvedInputAppearance(screenBrightness: brightness)
         let glassInputsEnabled = settings.liquidGlassInputsEnabled
 
         // Clock at the top of every display, like the macOS lock screen.
@@ -2408,11 +1181,12 @@ private final class LockerController: NSObject {
             clock.stack.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             clock.stack.topAnchor.constraint(equalTo: root.topAnchor, constant: compact ? 64 : 110)
         ])
-        clockLabels.append((clock.time, clock.date))
-
-        guard primary else { return root }
 
         let usePIN = settings.unlockStyle == .pin
+        var passwordField: NSSecureTextField?
+        var pinInputView: PINInputView?
+        var pinRecoveryField: NSSecureTextField?
+        var pinRecoveryContainer: NSView?
 
         let badgeDiameter: CGFloat = 76
         // With face unlock ready the badge *is* the camera button: it already occupies the spot
@@ -2518,13 +1292,12 @@ private final class LockerController: NSObject {
             status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: compact ? -28 : -44)
         ])
 
-        // Password unlock has no keypad to host Touch ID, so it keeps the standalone icon
-        // button. PIN unlock places Touch ID inside the keypad instead (see above).
+        // Password unlock has no keypad to host Touch ID, so it keeps the standalone button.
+        // PIN unlock places Touch ID inside the keypad instead (see above).
         if touchIDAvailable, !usePIN {
             let button = makeTouchIDButton(appearance: appearance)
             stack.setCustomSpacing(8, after: inputView)
             stack.addArrangedSubview(button)
-            touchIDButton = button
         }
 
         if usePIN {
@@ -2551,9 +1324,20 @@ private final class LockerController: NSObject {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: status.topAnchor, constant: -12)
         ])
 
-        statusLabel = status
+        let panel = LockScreenPanel(
+            window: window,
+            displayID: screen.directDisplayID,
+            displayName: screen.localizedName,
+            clock: (clock.time, clock.date),
+            stack: stack,
+            status: status
+        )
+        panel.passwordField = passwordField
+        panel.pinInputView = pinInputView
+        panel.pinRecoveryField = pinRecoveryField
+        panel.pinRecoveryContainer = pinRecoveryContainer
 
-        if FaceUnlockSettings.shared.isReadyForLockScreen {
+        if faceReady {
             // The self-view takes the lock badge's place: same circle, same spot in the stack.
             // It stays hidden until the camera is running, so the padlock shows until then.
             // Transparent hit area over the badge. Added before the self-view so a running scan's
@@ -2566,8 +1350,8 @@ private final class LockerController: NSObject {
                 scanButton.topAnchor.constraint(equalTo: badge.topAnchor),
                 scanButton.bottomAnchor.constraint(equalTo: badge.bottomAnchor)
             ])
-            faceScanButton = scanButton
-            updateFaceScanButton()
+            scanButton.isEnabled = !FaceUnlockController.shared.isScanning
+            panel.faceScanButton = scanButton
 
             let selfView = LockFaceSelfView(diameter: badgeDiameter)
             badge.addSubview(selfView)
@@ -2575,11 +1359,19 @@ private final class LockerController: NSObject {
                 selfView.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
                 selfView.centerYAnchor.constraint(equalTo: badge.centerYAnchor)
             ])
-            faceSelfView = selfView
-            selfView.setState(faceViewState)
-            if let faceSession { selfView.attachPreview(session: faceSession) }
+            panel.faceSelfView = selfView
         }
-        return root
+
+        // Hidden until `activatePanel` picks this display; the preview (if a scan is running)
+        // is attached there too, so only the active display ever holds a preview layer.
+        panel.isActive = false
+        window.contentView = root
+        window.onPointerDown = { [weak self, weak panel] in
+            guard let self, let panel, self.isLocked else { return }
+            self.activatePanel(panel)
+        }
+        window.orderFrontRegardless()
+        return panel
     }
 
     private func makeClockBlock(appearance: LockForegroundAppearance, compact: Bool = false) -> (stack: NSStackView, time: NSTextField, date: NSTextField) {
@@ -2628,8 +1420,8 @@ private final class LockerController: NSObject {
     }
 
     private func updateAllClocks() {
-        for pair in clockLabels {
-            updateClockLabels(time: pair.time, date: pair.date)
+        for panel in panels {
+            updateClockLabels(time: panel.clock.time, date: panel.clock.date)
         }
     }
 
@@ -2804,9 +1596,7 @@ private final class LockerController: NSObject {
     }
 
     private func resetCredentialInput() {
-        passwordField?.stringValue = ""
-        pinInputView?.reset()
-        pinRecoveryField?.stringValue = ""
+        panels.forEach { $0.clearInput() }
     }
 
     private func configureInitialInputState(for trigger: LockTrigger) {
@@ -3005,17 +1795,25 @@ private final class LockerController: NSObject {
         if let eventTap, !CGEvent.tapIsEnabled(tap: eventTap) {
             reenableEventTap()
         }
-        NSApp.activate(ignoringOtherApps: true)
         NSApp.presentationOptions = lockPresentationOptions
+        // While the system Touch ID sheet is up, leave the window order and app activation
+        // alone. Re-fronting the lock windows (screen-saver level) covers the sheet, and
+        // activating the app pulls focus from it: the prompt "closed" the moment any key or
+        // click arrived, while LocalAuthentication kept waiting for a finger nobody could see.
+        guard !biometricInProgress else { return }
+        NSApp.activate(ignoringOtherApps: true)
         windows.forEach { $0.orderFrontRegardless() }
 
-        // While the system Touch ID sheet is up, don't steal focus back to the
-        // input — that would dismiss the biometric prompt.
-        guard refocusInput, !biometricInProgress else { return }
+        guard refocusInput else { return }
         focusActiveInput()
     }
 
     private func focusActiveInput() {
+        // A display plugged in mid-lock can grab key status when its window is ordered in; the
+        // input's window must hold it or keystrokes go to a window with no field.
+        if let window = activePanel?.window, !window.isKeyWindow {
+            window.makeKeyAndOrderFront(nil)
+        }
         if let pinInputView, !pinInputView.isHidden {
             if pinInputView.window?.firstResponder !== pinInputView {
                 pinInputView.window?.makeKeyAndOrderFront(nil)
@@ -3042,21 +1840,49 @@ private final class LockerController: NSObject {
         }
     }
 
+    /// Password mode has no keypad cell for Touch ID, so it gets a labelled button under the
+    /// field. It is the way to bring the system prompt back after "Use Password" dismissed it;
+    /// the prompt itself comes up on its own when the lock goes up (see
+    /// `scheduleAutomaticTouchIDPrompt`).
     private func makeTouchIDButton(appearance: LockForegroundAppearance) -> NSButton {
         let button = NSButton(title: "", target: self, action: #selector(touchIDTapped))
-        let config = NSImage.SymbolConfiguration(pointSize: 30, weight: .regular)
+        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
         button.image = NSImage(systemSymbolName: "touchid", accessibilityDescription: "Unlock with Touch ID")?
             .withSymbolConfiguration(config)
-        button.imagePosition = .imageOnly
+        button.imagePosition = .imageLeading
+        button.attributedTitle = NSAttributedString(
+            string: "Use Touch ID",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                .foregroundColor: appearance.primaryText.withAlphaComponent(0.85)
+            ]
+        )
         button.contentTintColor = appearance.primaryText.withAlphaComponent(0.85)
         button.isBordered = false
         button.bezelStyle = .accessoryBarAction
-        button.toolTip = "Unlock with Touch ID"
+        button.toolTip = "Unlock with Touch ID (\(settings.touchIDTriggerKey.title))"
         return button
     }
 
     @objc private func touchIDTapped() {
         attemptBiometricUnlock(automatic: false)
+    }
+
+    /// Opt-in ("Open Touch ID automatically when locked"). Off by default: the system sheet
+    /// covers the passcode field, and macOS has no public API to read the sensor without it, so
+    /// the default is a passcode field that is always ready plus a key that opens the sheet.
+    /// Short delay so the lock windows are on screen under it first.
+    private func scheduleAutomaticTouchIDPrompt() {
+        biometricPromptTimer?.invalidate()
+        biometricPromptTimer = nil
+        guard touchIDUsable, settings.touchIDPromptOnLock else { return }
+        biometricPromptTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.biometricPromptTimer = nil
+                self.attemptBiometricUnlock(automatic: true)
+            }
+        }
     }
 
     private static let faceScanHint = "Press Space or tap the camera button to scan your face."
@@ -3081,31 +1907,54 @@ private final class LockerController: NSObject {
         beginFaceScan()
     }
 
-    /// Space starts a face scan without moving focus off the passcode input. It only fires while
-    /// the input is empty, so a space inside a password is still typed as a space.
-    private func installFaceScanKeyMonitor() {
-        guard faceScanKeyMonitor == nil else { return }
-        faceScanKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.handleFaceScanKey(event) else { return event }
+    /// Space starts the biometric way in without moving focus off the passcode input: a face
+    /// scan when face unlock is set up, otherwise the Touch ID prompt. It only fires while the
+    /// input is empty, so a space inside a password is still typed as a space.
+    private func installUnlockShortcutKeyMonitor() {
+        guard unlockShortcutKeyMonitor == nil else { return }
+        unlockShortcutKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self, self.handleUnlockShortcutKey(event) else { return event }
             return nil
         }
     }
 
-    private func removeFaceScanKeyMonitor() {
-        if let faceScanKeyMonitor { NSEvent.removeMonitor(faceScanKeyMonitor) }
-        faceScanKeyMonitor = nil
+    private func removeUnlockShortcutKeyMonitor() {
+        if let unlockShortcutKeyMonitor { NSEvent.removeMonitor(unlockShortcutKeyMonitor) }
+        unlockShortcutKeyMonitor = nil
     }
 
-    /// True when the event was consumed as the face-scan shortcut.
-    private func handleFaceScanKey(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 49 else { return false } // Space
+    /// True when the event was consumed as the unlock shortcut.
+    private func handleUnlockShortcutKey(_ event: NSEvent) -> Bool {
+        // Release of a Touch ID key that was pressed on an empty field. Only that press counts:
+        // the release of a Return that just submitted a passcode finds the field empty again,
+        // and must not open Touch ID.
+        if event.type == .keyUp, event.keyCode == settings.touchIDTriggerKey.keyCode, touchIDKeyArmed {
+            touchIDKeyArmed = false
+            if isLocked, lockoutTimer == nil, !biometricInProgress, touchIDUsable {
+                attemptBiometricUnlock(automatic: false)
+            }
+            return true
+        }
         guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty else { return false }
-        guard !windows.isEmpty, lockoutTimer == nil, !biometricInProgress else { return false }
-        guard FaceUnlockSettings.shared.isReadyForLockScreen else { return false }
-        guard !FaceUnlockController.shared.isScanning else { return true }
+        guard isLocked, inputEnabled, lockoutTimer == nil, !biometricInProgress else { return false }
+        // Typed text wins: a space inside a passcode must reach the field, even mid-scan.
         guard isCredentialInputEmpty else { return false }
-        beginFaceScan()
-        return true
+        // Touch ID's key is checked first, so picking Space for it keeps it working with face on.
+        // The prompt opens when the key is *released*: opened on the press, the same keystroke
+        // (its auto-repeat, or Return / Esc acting on the sheet's own buttons) lands on the new
+        // sheet and dismisses it. The press is swallowed so the field never sees it.
+        guard event.type == .keyDown else { return false }
+        if touchIDUsable, event.keyCode == settings.touchIDTriggerKey.keyCode {
+            touchIDKeyArmed = true
+            return true
+        }
+        if event.keyCode == 49, FaceUnlockSettings.shared.isReadyForLockScreen {
+            if !FaceUnlockController.shared.isScanning {
+                beginFaceScan()
+            }
+            return true
+        }
+        return false
     }
 
     /// Nothing typed yet in whichever credential field is on screen.
@@ -3120,21 +1969,33 @@ private final class LockerController: NSObject {
     private func attemptBiometricUnlock(automatic: Bool) {
         // Touch ID has to respect the brute-force lockout too, or the standalone button in
         // password mode offers a way around the backoff the keypad enforces.
-        guard lockoutTimer == nil else { return }
-        guard settings.useTouchID, BiometricAuth.isAvailable, !biometricInProgress else { return }
+        guard isLocked, lockoutTimer == nil else { return }
+        guard touchIDUsable, !biometricInProgress else { return }
         biometricInProgress = true
 
-        BiometricAuth.evaluate(reason: "unlock SoftLock") { [weak self] success in
+        biometricContext = BiometricAuth.evaluate(reason: "unlock SoftLock") { [weak self] outcome in
             guard let self else { return }
             self.biometricInProgress = false
+            self.biometricContext = nil
+            // Unlocked by another route while the sheet was up (face, passcode, macOS login):
+            // the late completion must not re-present a lock screen that is already gone.
+            guard self.isLocked else { return }
 
-            if success {
+            switch outcome {
+            case .success:
                 self.unlock(recoveryUsed: false)
-            } else {
-                // Fall back to the password field; on a manual tap show a hint.
-                if !automatic {
-                    self.showStatus("Touch ID didn't match. Enter your password.")
-                }
+            case .cancelled:
+                // "Use Password" or Esc: the owner chose the passcode, so no complaint — only
+                // a reminder of how to bring the prompt back.
+                self.showIdleHint()
+                self.activateLock()
+            case .lockedOut:
+                self.showStatus("Touch ID is locked after too many tries. Enter your passcode.", tone: .warning)
+                self.activateLock()
+            case .failed:
+                // The automatic prompt failing silently would look like the app gave up; the
+                // manual retry failing deserves the same words.
+                self.showStatus("Touch ID didn't match. Enter your passcode.")
                 self.activateLock()
             }
         }
@@ -3177,9 +2038,7 @@ private final class LockerController: NSObject {
             unlock(recoveryUsed: true)
         case .invalid:
             failedAttempts += 1
-            passwordField?.stringValue = ""
-            pinRecoveryField?.stringValue = ""
-            pinInputView?.reset()
+            resetCredentialInput()
             captureFailedAttemptIfNeeded()
             applyThrottleOrShowError()
         }
@@ -3204,6 +2063,12 @@ private final class LockerController: NSObject {
 
     private func beginLockout(seconds: Int) {
         lockoutRemaining = seconds
+        // A running face scan would otherwise announce "Face recognized" and then be refused by
+        // the lockout. Face unlock waits the backoff out like every other route.
+        FaceUnlockController.shared.stop()
+        faceSession = nil
+        panels.forEach { $0.faceSelfView?.detach() }
+        updateFaceScanButton()
         setInputEnabled(false)
         showStatus("Too many attempts. Try again in \(lockoutRemaining)s.")
 
@@ -3220,21 +2085,22 @@ private final class LockerController: NSObject {
             lockoutTimer = nil
             setInputEnabled(true)
             showStatus("")
+            showIdleHint()
         } else {
             showStatus("Too many attempts. Try again in \(lockoutRemaining)s.")
         }
     }
 
     private func setInputEnabled(_ enabled: Bool) {
-        passwordField?.isEnabled = enabled
-        pinInputView?.isEnabled = enabled
-        pinRecoveryField?.isEnabled = enabled
+        inputEnabled = enabled
+        panels.forEach { $0.setInputEnabled(enabled) }
         if enabled, settings.unlockStyle == .password {
             passwordField?.becomeFirstResponder()
         }
     }
 
     private func showStatus(_ text: String, tone: FaceUnlockStatusKind = .error) {
+        lastStatus = (text, tone)
         statusLabel?.show(text, tone: tone)
     }
 
@@ -3256,16 +2122,25 @@ private final class LockerController: NSObject {
     /// prompt and is the forgot-PIN escape hatch: log into macOS and SoftLock releases,
     /// so the machine is never stranded behind a passcode the user no longer remembers.
     func standDown() {
-        guard !windows.isEmpty else { return }
+        guard isLocked else { return }
         AppLog.write("standDown: releasing after trusted macOS unlock")
         unlock(recoveryUsed: false)
     }
 
     private func unlock(recoveryUsed: Bool) {
         AppLog.write("unlock begin recoveryUsed=\(recoveryUsed)")
+        isLocked = false
         FaceUnlockController.shared.stop()
         FaceUnlockController.shared.noteUnlockedByOtherMeans()
-        removeFaceScanKeyMonitor()
+        removeUnlockShortcutKeyMonitor()
+        touchIDKeyArmed = false
+        biometricPromptTimer?.invalidate()
+        biometricPromptTimer = nil
+        biometricContext?.invalidate()
+        biometricContext = nil
+        // Stale state would carry into the next lock: a true flag stops the keypad taking
+        // focus and refuses the next Touch ID attempt until an orphaned sheet is dismissed.
+        biometricInProgress = false
         faceSession = nil
         faceViewState = .scanning
         faceSelfView?.detach()
@@ -3312,6 +2187,19 @@ private final class LockWindow: NSWindow {
     let displayID: UInt32?
     /// Whether the content was laid out for a short display; see `LockerController.isCompact`.
     var builtCompact = false
+    /// Any mouse button pressed anywhere in this window, before the view hierarchy sees it.
+    /// The lock controller uses it to move the passcode input to the display that was clicked.
+    var onPointerDown: (() -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            onPointerDown?()
+        default:
+            break
+        }
+        super.sendEvent(event)
+    }
 
     init(screen: NSScreen) {
         displayID = screen.directDisplayID
@@ -3350,13 +2238,93 @@ private final class LockWindow: NSWindow {
     }
 }
 
+/// One display's lock screen: the clock every display shows, plus the credential stack and the
+/// status pill that only the active display shows (see `LockerController.activatePanel`). Each
+/// panel is laid out for its own screen — compact metrics, its own sampled brightness — so
+/// moving the input to another display never shows controls styled for a different wallpaper.
+@MainActor
+private final class LockScreenPanel {
+    let window: LockWindow
+    let displayID: UInt32?
+    /// `NSScreen.localizedName`; what the "Show unlock controls on" setting stores.
+    let displayName: String
+    let clock: (time: NSTextField, date: NSTextField)
+    let stack: NSStackView
+    let status: LockStatusView
+    var passwordField: NSSecureTextField?
+    var pinInputView: PINInputView?
+    var pinRecoveryField: NSSecureTextField?
+    var pinRecoveryContainer: NSView?
+    var faceScanButton: NSButton?
+    var faceSelfView: LockFaceSelfView?
+
+    /// Shows or hides everything but the clock.
+    var isActive = false {
+        didSet {
+            stack.isHidden = !isActive
+            status.isHidden = !isActive
+        }
+    }
+
+    init(
+        window: LockWindow,
+        displayID: UInt32?,
+        displayName: String,
+        clock: (time: NSTextField, date: NSTextField),
+        stack: NSStackView,
+        status: LockStatusView
+    ) {
+        self.window = window
+        self.displayID = displayID
+        self.displayName = displayName
+        self.clock = clock
+        self.stack = stack
+        self.status = status
+    }
+
+    var isBuiltInDisplay: Bool {
+        displayID.map { CGDisplayIsBuiltin($0) != 0 } ?? false
+    }
+
+    /// Takes over whatever `other` holds: typed passcode / PIN digits / recovery code, and
+    /// whether the recovery field is showing instead of the keypad.
+    func adoptInput(from other: LockScreenPanel) {
+        passwordField?.stringValue = other.passwordField?.stringValue ?? ""
+        pinInputView?.restore(digits: other.pinInputView?.enteredDigits ?? "")
+        pinRecoveryField?.stringValue = other.pinRecoveryField?.stringValue ?? ""
+        setRecoveryEntryShown(other.isRecoveryEntryShown)
+    }
+
+    var isRecoveryEntryShown: Bool {
+        pinRecoveryContainer.map { !$0.isHidden } ?? false
+    }
+
+    func setRecoveryEntryShown(_ shown: Bool) {
+        guard pinRecoveryContainer != nil, pinInputView != nil else { return }
+        pinRecoveryContainer?.isHidden = !shown
+        pinInputView?.isHidden = shown
+    }
+
+    func clearInput() {
+        passwordField?.stringValue = ""
+        pinInputView?.reset()
+        pinRecoveryField?.stringValue = ""
+    }
+
+    func setInputEnabled(_ enabled: Bool) {
+        passwordField?.isEnabled = enabled
+        pinInputView?.isEnabled = enabled
+        pinRecoveryField?.isEnabled = enabled
+    }
+}
+
 private extension NSScreen {
     var directDisplayID: UInt32? {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
     }
 }
 
-private extension NSWindow {
+extension NSWindow {
     /// Center on the screen the user is currently on (the one under the pointer, which is
     /// also the screen whose menu bar they just clicked), not always the primary display.
     func centerOnActiveScreen() {
@@ -3758,7 +2726,7 @@ private final class LockGlassInputView: NSView {
     }
 }
 
-private enum BackgroundEffectKind: String, CaseIterable {
+enum BackgroundEffectKind: String, CaseIterable {
     case transparent
     case blur
     case color
@@ -3774,7 +2742,7 @@ private enum BackgroundEffectKind: String, CaseIterable {
     }
 }
 
-private enum BackgroundMediaKind: String {
+enum BackgroundMediaKind: String {
     case image
     case video
 
@@ -3797,7 +2765,7 @@ private enum BackgroundMediaError: LocalizedError {
     }
 }
 
-private enum InputAppearanceMode: String, CaseIterable {
+enum InputAppearanceMode: String, CaseIterable {
     case auto
     case light
     case dark
@@ -3811,7 +2779,7 @@ private enum InputAppearanceMode: String, CaseIterable {
     }
 }
 
-private struct SystemWallpaperAsset {
+struct SystemWallpaperAsset {
     let title: String
     let sourceURL: URL
     let thumbnailURL: URL?
@@ -3841,7 +2809,7 @@ private struct SystemWallpaperAsset {
     }
 }
 
-private enum SystemWallpaperLibrary {
+enum SystemWallpaperLibrary {
     private static let desktopPicturesURL = URL(fileURLWithPath: "/System/Library/Desktop Pictures", isDirectory: true)
     private static let wallpaperVideosURL = desktopPicturesURL.appendingPathComponent(".wallpapers", isDirectory: true)
     private static let userAerialsURL = FileManager.default.homeDirectoryForCurrentUser
@@ -3986,7 +2954,7 @@ private enum SystemWallpaperLibrary {
 }
 
 @MainActor
-private final class WallpaperPickerWindowController: NSObject {
+final class WallpaperPickerWindowController: NSObject {
     let window: NSWindow
     private let assets: [SystemWallpaperAsset]
     private let onSelect: (SystemWallpaperAsset) -> Void
@@ -4234,7 +3202,7 @@ private final class WallpaperTileView: NSControl {
     }
 }
 
-private struct LockBackgroundSwatch {
+struct LockBackgroundSwatch {
     let id: String
     let title: String
     let color: NSColor
@@ -4283,7 +3251,7 @@ private extension URL {
     }
 }
 
-private extension AVAuthorizationStatus {
+extension AVAuthorizationStatus {
     var permissionDetail: String {
         switch self {
         case .authorized:
@@ -4315,7 +3283,7 @@ private func madeDesktopThumbnailURL(from url: URL) -> URL? {
 }
 
 @MainActor
-private final class AppSettings {
+final class AppSettings {
     static let shared = AppSettings()
     static let defaultLockTitle = "SoftLock"
     static let defaultBlurLevel = 0.56
@@ -4335,6 +3303,9 @@ private final class AppSettings {
     private let captureKey = "capturePhotoOnFailure"
     private let maxPhotosKey = "maxFailedAttemptPhotos"
     private let touchIDKey = "useTouchID"
+    private let touchIDPromptKey = "touchIDPromptOnLock"
+    private let touchIDKeyKey = "touchIDTriggerKey"
+    private let unlockDisplayKey = "unlockDisplayName"
     private let unlockStyleKey = "unlockStyle"
     private let pinLengthKey = "pinLength"
     private let shortcutKeyCodeKey = "lockShortcutKeyCode"
@@ -4413,6 +3384,37 @@ private final class AppSettings {
         }
         set {
             defaults.set(newValue, forKey: touchIDKey)
+        }
+    }
+
+    /// Present the system Touch ID sheet as soon as the lock goes up, so a fingerprint alone
+    /// unlocks without a tap first. Default on: that is the behaviour the README always promised.
+    var touchIDPromptOnLock: Bool {
+        get { defaults.bool(forKey: touchIDPromptKey) }
+        set { defaults.set(newValue, forKey: touchIDPromptKey) }
+    }
+
+    /// The key that opens the Touch ID prompt on the lock screen while the passcode field is
+    /// empty. Return by default: it does nothing on an empty field, and Space stays free for face.
+    var touchIDTriggerKey: TouchIDTriggerKey {
+        get { TouchIDTriggerKey(rawValue: defaults.string(forKey: touchIDKeyKey) ?? "") ?? .returnKey }
+        set { defaults.set(newValue.rawValue, forKey: touchIDKeyKey) }
+    }
+
+    /// `NSScreen.localizedName` of the display that should show the passcode when the lock
+    /// goes up; nil means automatic (see `LockerController.preferredPanel`). Stored by name
+    /// rather than display ID because IDs change across reboots and reconnects.
+    var unlockDisplayName: String? {
+        get {
+            let name = defaults.string(forKey: unlockDisplayKey)
+            return name?.isEmpty == false ? name : nil
+        }
+        set {
+            if let newValue, !newValue.isEmpty {
+                defaults.set(newValue, forKey: unlockDisplayKey)
+            } else {
+                defaults.removeObject(forKey: unlockDisplayKey)
+            }
         }
     }
 
@@ -4505,7 +3507,7 @@ private final class AppSettings {
         defaults.string(forKey: backgroundMediaDisplayNameKey) ?? backgroundMediaURL?.lastPathComponent ?? "No file"
     }
 
-    func resolvedInputAppearance(screenBrightness: Double? = nil) -> LockForegroundAppearance {
+    fileprivate func resolvedInputAppearance(screenBrightness: Double? = nil) -> LockForegroundAppearance {
         switch inputAppearanceMode {
         case .light:
             return .light
@@ -4727,6 +3729,35 @@ private enum CredentialResult {
     case invalid
 }
 
+/// Non-printing keys only: pressed on an empty field they never swallow the first character of
+/// a passcode.
+enum TouchIDTriggerKey: String, CaseIterable, Identifiable {
+    case returnKey
+    case tab
+    case escape
+    case space
+
+    var id: String { rawValue }
+
+    var keyCode: UInt16 {
+        switch self {
+        case .returnKey: return 36
+        case .tab: return 48
+        case .escape: return 53
+        case .space: return 49
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .returnKey: return "Return"
+        case .tab: return "Tab"
+        case .escape: return "Esc"
+        case .space: return "Space"
+        }
+    }
+}
+
 enum UnlockStyle: String {
     case password
     case pin
@@ -4761,13 +3792,10 @@ private final class FailedAttemptCamera: NSObject, AVCapturePhotoCaptureDelegate
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             captureAuthorized()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                DispatchQueue.main.async {
-                    granted ? self?.captureAuthorized() : self?.finish(.failure(CameraError.permissionDenied))
-                }
-            }
-        case .denied, .restricted:
+        case .notDetermined, .denied, .restricted:
+            // Never prompt from here: this runs on the lock screen, where the system dialog
+            // would appear behind the lock windows and leave the capture wedged. The grant is
+            // requested in Settings (Privacy pane) when the feature is switched on.
             finish(.failure(CameraError.permissionDenied))
         @unknown default:
             finish(.failure(CameraError.permissionDenied))
@@ -4779,7 +3807,10 @@ private final class FailedAttemptCamera: NSObject, AVCapturePhotoCaptureDelegate
             let session = AVCaptureSession()
             session.sessionPreset = .photo
 
-            guard let device = AVCaptureDevice.default(for: .video) else {
+            // Same camera face unlock uses, so the evidence photo shows whoever stood in front
+            // of the camera the owner actually set up (clamshell MacBooks have a lid camera
+            // that sees nothing).
+            guard let device = FaceCameraFeed.resolveDevice(preferredUniqueID: FaceUnlockSettings.shared.cameraUniqueID) else {
                 throw CameraError.noCamera
             }
 
@@ -4907,7 +3938,7 @@ struct LockShortcut: Equatable, Codable {
     }
 
     var cocoaModifiers: NSEvent.ModifierFlags {
-        NSEvent.ModifierFlags(rawValue: UInt(modifiers)).intersection(.deviceIndependentFlagsMask)
+        NSEvent.ModifierFlags(rawValue: UInt(modifiers)).intersection([.command, .option, .control, .shift])
     }
 
     /// Carbon modifier mask for RegisterEventHotKey.
@@ -5295,6 +4326,15 @@ final class PINInputView: NSView {
     /// face-scan shortcut.
     var hasInput: Bool { !digits.isEmpty }
 
+    /// The digits typed so far, for carrying a half-entered PIN to another display's keypad.
+    var enteredDigits: String { digits }
+
+    /// Sets the typed digits without firing completion: the lock screen only ever hands over a
+    /// partial PIN (a full one is verified and cleared before it could be moved).
+    func restore(digits value: String) {
+        digits = String(value.prefix(length))
+    }
+
     override var acceptsFirstResponder: Bool { true }
 
     override func keyDown(with event: NSEvent) {
@@ -5398,7 +4438,10 @@ final class ShortcutRecorderView: NSView {
             return
         }
 
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Only the four real modifiers: Caps Lock, fn and numeric-pad flags ride along in
+        // `deviceIndependentFlagsMask` but Carbon registration ignores them, so storing them made
+        // duplicate detection disagree with what actually fires.
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         guard !mods.intersection([.command, .option, .control]).isEmpty else {
             NSSound.beep() // require at least one of ⌃⌥⌘ so the hotkey is global-safe
             return
@@ -5456,7 +4499,7 @@ final class ShortcutRecorderView: NSView {
     }
 }
 
-private enum BiometricAuth {
+enum BiometricAuth {
     /// True when this Mac has Touch ID (built-in or Magic Keyboard) enrolled and usable.
     static var isAvailable: Bool {
         let context = LAContext()
@@ -5465,8 +4508,19 @@ private enum BiometricAuth {
         return canEvaluate && context.biometryType == .touchID
     }
 
+    enum Outcome: Sendable {
+        case success
+        /// The owner dismissed the sheet ("Use Password", Esc, or the app/system cancelled it).
+        case cancelled
+        /// Biometry is locked after too many failed tries until the account password is used.
+        case lockedOut
+        /// The finger did not match, or the sensor could not be read.
+        case failed
+    }
+
     /// Presents the system Touch ID sheet. `completion` is always called on the main actor.
-    static func evaluate(reason: String, completion: @escaping @MainActor (Bool) -> Void) {
+    @discardableResult
+    static func evaluate(reason: String, completion: @escaping @MainActor (Outcome) -> Void) -> LAContext {
         let context = LAContext()
         context.localizedFallbackTitle = ""
         context.localizedCancelTitle = "Use Password"
@@ -5474,20 +4528,36 @@ private enum BiometricAuth {
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
             AppLog.write("biometrics unavailable: \(error?.localizedDescription ?? "unknown")")
-            Task { @MainActor in completion(false) }
-            return
+            let outcome: Outcome = (error as? LAError)?.code == .biometryLockout ? .lockedOut : .failed
+            Task { @MainActor in completion(outcome) }
+            return context
         }
 
         context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, evalError in
-            if let evalError {
-                AppLog.write("biometric evaluate result success=\(success) error=\(evalError.localizedDescription)")
+            let outcome: Outcome
+            if success {
+                outcome = .success
+            } else if let laError = evalError as? LAError {
+                switch laError.code {
+                case .userCancel, .systemCancel, .appCancel, .userFallback:
+                    outcome = .cancelled
+                case .biometryLockout:
+                    outcome = .lockedOut
+                default:
+                    outcome = .failed
+                }
+                AppLog.write("biometric evaluate failed: \(laError.localizedDescription)")
+            } else {
+                outcome = .failed
+                AppLog.write("biometric evaluate failed: \(evalError?.localizedDescription ?? "unknown")")
             }
-            Task { @MainActor in completion(success) }
+            Task { @MainActor in completion(outcome) }
         }
+        return context
     }
 }
 
-private enum FailedAttemptStore {
+enum FailedAttemptStore {
     static func directory() throws -> URL {
         let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let directoryURL = baseURL
@@ -5690,7 +4760,10 @@ private final class PasswordStore {
     private func loadRecord() -> PasswordRecord? {
         guard
             let data = try? Data(contentsOf: fileURL),
-            let record = try? JSONDecoder().decode(PasswordRecord.self, from: data)
+            let record = try? JSONDecoder().decode(PasswordRecord.self, from: data),
+            // `1..<iterations` traps below 1: a tampered or corrupt file must read as "no
+            // password", never crash the lock screen.
+            (1...10_000_000).contains(record.iterations)
         else {
             return nil
         }
@@ -5745,7 +4818,7 @@ private enum PasswordError: LocalizedError {
     }
 }
 
-private enum AppLog {
+enum AppLog {
     static func write(_ message: String) {
         let directoryURL = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
